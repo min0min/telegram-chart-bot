@@ -16,10 +16,12 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default-secret")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BITGET_API = "https://api.bitget.com"
 
+SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
+
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Drawing V4 Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V6 Ready"}
 
 
 @app.get("/health")
@@ -41,12 +43,35 @@ def send_photo(chat_id: int, image_path: str, caption: str):
             f"{TELEGRAM_API}/sendPhoto",
             data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
             files={"photo": image},
-            timeout=40
+            timeout=45
         )
 
 
-def normalize_symbol(command: str) -> str:
-    coin = command.replace("/", "").split("@")[0].upper()
+def get_bitget_symbols(force: bool = False) -> set:
+    now = time.time()
+    if not force and SYMBOL_CACHE["symbols"] and now - SYMBOL_CACHE["updated_at"] < 3600:
+        return SYMBOL_CACHE["symbols"]
+
+    r = requests.get(
+        f"{BITGET_API}/api/v2/mix/market/contracts",
+        params={"productType": "USDT-FUTURES"},
+        timeout=15
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"contracts HTTP {r.status_code}: {r.text[:200]}")
+
+    data = r.json()
+    if data.get("code") != "00000":
+        raise RuntimeError(f"contracts Bitget error: {data}")
+
+    symbols = {item.get("symbol", "").upper() for item in data.get("data", []) if item.get("symbol")}
+    SYMBOL_CACHE["symbols"] = symbols
+    SYMBOL_CACHE["updated_at"] = now
+    return symbols
+
+
+def normalize_symbol(raw: str) -> str:
+    coin = raw.replace("/", "").split("@")[0].upper().strip()
     aliases = {
         "BTC": "BTCUSDT", "BITCOIN": "BTCUSDT",
         "ETH": "ETHUSDT", "ETHEREUM": "ETHUSDT",
@@ -58,6 +83,13 @@ def normalize_symbol(command: str) -> str:
     if coin.endswith("USDT"):
         return coin
     return f"{coin}USDT"
+
+
+def is_valid_symbol(symbol: str) -> bool:
+    try:
+        return symbol.upper() in get_bitget_symbols()
+    except Exception:
+        return True
 
 
 def normalize_interval(interval: str) -> str:
@@ -74,52 +106,67 @@ def display_interval(interval: str) -> str:
     return interval.replace("H", "h").replace("D", "d").replace("W", "w")
 
 
-def parse_command(text: str):
+def parse_chart_command(text: str):
     parts = text.strip().split()
-    command = parts[0]
-    interval = parts[1] if len(parts) >= 2 else "15m"
-    return normalize_symbol(command), normalize_interval(interval)
+    symbol = normalize_symbol(parts[0])
+    interval = normalize_interval(parts[1] if len(parts) >= 2 else "15m")
+    return symbol, interval
 
 
-def pivot_window_by_interval(interval: str) -> int:
-    if interval in {"1m", "3m", "5m"}:
-        return 3
-    if interval in {"15m", "30m", "1H"}:
-        return 4
-    if interval in {"2H", "4H", "6H"}:
-        return 5
-    return 6
+def timeframe_profile(interval: str):
+    profiles = {
+        "1m":  {"name": "초단타", "entry_buffer": 0.18, "sl_atr": 0.70, "tp1_atr": 0.85, "tp2_atr": 1.35, "max_wait": "5~20분"},
+        "3m":  {"name": "초단타", "entry_buffer": 0.20, "sl_atr": 0.75, "tp1_atr": 0.95, "tp2_atr": 1.55, "max_wait": "10~40분"},
+        "5m":  {"name": "단타", "entry_buffer": 0.22, "sl_atr": 0.85, "tp1_atr": 1.05, "tp2_atr": 1.75, "max_wait": "20분~1시간"},
+        "15m": {"name": "단타/스캘핑", "entry_buffer": 0.25, "sl_atr": 1.00, "tp1_atr": 1.25, "tp2_atr": 2.00, "max_wait": "1~4시간"},
+        "30m": {"name": "단기", "entry_buffer": 0.28, "sl_atr": 1.10, "tp1_atr": 1.40, "tp2_atr": 2.25, "max_wait": "2~8시간"},
+        "1H":  {"name": "단기 스윙", "entry_buffer": 0.32, "sl_atr": 1.25, "tp1_atr": 1.60, "tp2_atr": 2.60, "max_wait": "반나절~1일"},
+        "2H":  {"name": "스윙", "entry_buffer": 0.35, "sl_atr": 1.35, "tp1_atr": 1.80, "tp2_atr": 3.00, "max_wait": "1~2일"},
+        "4H":  {"name": "스윙", "entry_buffer": 0.40, "sl_atr": 1.55, "tp1_atr": 2.10, "tp2_atr": 3.50, "max_wait": "2~5일"},
+        "6H":  {"name": "스윙", "entry_buffer": 0.42, "sl_atr": 1.70, "tp1_atr": 2.30, "tp2_atr": 3.80, "max_wait": "3~7일"},
+        "12H": {"name": "중기 스윙", "entry_buffer": 0.45, "sl_atr": 1.90, "tp1_atr": 2.60, "tp2_atr": 4.20, "max_wait": "1~2주"},
+        "1D":  {"name": "일봉 스윙", "entry_buffer": 0.50, "sl_atr": 2.20, "tp1_atr": 3.00, "tp2_atr": 5.00, "max_wait": "1~4주"},
+        "3D":  {"name": "중장기", "entry_buffer": 0.60, "sl_atr": 2.60, "tp1_atr": 3.80, "tp2_atr": 6.50, "max_wait": "수 주"},
+        "1W":  {"name": "장기", "entry_buffer": 0.70, "sl_atr": 3.00, "tp1_atr": 5.00, "tp2_atr": 8.00, "max_wait": "수 주~수 개월"},
+    }
+    return profiles.get(interval, profiles["15m"])
 
 
 def get_bitget_ticker(symbol: str):
-    url = f"{BITGET_API}/api/v2/mix/market/ticker"
-    params = {"symbol": symbol, "productType": "USDT-FUTURES"}
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(
+        f"{BITGET_API}/api/v2/mix/market/ticker",
+        params={"symbol": symbol, "productType": "USDT-FUTURES"},
+        timeout=15
+    )
     if r.status_code != 200:
         raise RuntimeError(f"ticker HTTP {r.status_code}: {r.text[:200]}")
+
     data = r.json()
     if data.get("code") != "00000":
         raise RuntimeError(f"ticker Bitget error: {data}")
+
     t = data["data"][0]
-    price = float(t["lastPr"])
-    change_raw = float(t.get("change24h", 0))
-    return {"price": price, "change_percent": change_raw * 100}
+    return {
+        "price": float(t["lastPr"]),
+        "change_percent": float(t.get("change24h", 0)) * 100,
+        "high24h": float(t.get("high24h", 0) or 0),
+        "low24h": float(t.get("low24h", 0) or 0)
+    }
 
 
 def get_bitget_candles(symbol: str, granularity: str, limit: int = 200) -> pd.DataFrame:
-    url = f"{BITGET_API}/api/v2/mix/market/history-candles"
-    params = {
-        "symbol": symbol,
-        "productType": "USDT-FUTURES",
-        "granularity": granularity,
-        "limit": str(limit)
-    }
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(
+        f"{BITGET_API}/api/v2/mix/market/history-candles",
+        params={"symbol": symbol, "productType": "USDT-FUTURES", "granularity": granularity, "limit": str(limit)},
+        timeout=15
+    )
     if r.status_code != 200:
         raise RuntimeError(f"candles HTTP {r.status_code}: {r.text[:200]}")
+
     data = r.json()
     if data.get("code") != "00000":
         raise RuntimeError(f"candles Bitget error: {data}")
+
     rows = data.get("data", [])
     if not rows:
         raise RuntimeError("No candle data returned")
@@ -140,41 +187,42 @@ def get_bitget_candles(symbol: str, granularity: str, limit: int = 200) -> pd.Da
 def atr_value(df: pd.DataFrame, period: int = 14) -> float:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([high-low, (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
     atr = tr.rolling(period).mean().iloc[-1]
     if pd.isna(atr) or atr <= 0:
         atr = (df["High"] - df["Low"]).tail(period).mean()
     return float(atr)
 
 
+def pivot_window_by_interval(interval: str) -> int:
+    if interval in {"1m", "3m", "5m"}:
+        return 3
+    if interval in {"15m", "30m", "1H"}:
+        return 4
+    if interval in {"2H", "4H", "6H"}:
+        return 5
+    return 6
+
+
 def find_pivots(df: pd.DataFrame, window: int):
     highs, lows = [], []
     h, l = df["High"].values, df["Low"].values
-
-    for i in range(window, len(df) - window):
+    for i in range(window, len(df)-window):
         if h[i] > max(h[i-window:i]) and h[i] >= max(h[i+1:i+window+1]):
             highs.append((i, df.index[i], float(h[i])))
         if l[i] < min(l[i-window:i]) and l[i] <= min(l[i+1:i+window+1]):
             lows.append((i, df.index[i], float(l[i])))
-
     return highs, lows
 
 
 def market_regime(df: pd.DataFrame, current: float):
     recent = df.tail(55)
-    start = float(recent["Close"].iloc[0])
-    end = float(recent["Close"].iloc[-1])
+    start, end = float(recent["Close"].iloc[0]), float(recent["Close"].iloc[-1])
     move_pct = (end - start) / current * 100
-    high = float(recent["High"].max())
-    low = float(recent["Low"].min())
-    range_pct = (high - low) / current * 100
-
+    range_pct = (float(recent["High"].max()) - float(recent["Low"].min())) / current * 100
     ma20 = float(df["Close"].rolling(20).mean().iloc[-1])
     ma60 = float(df["Close"].rolling(60).mean().iloc[-1])
+    ma120 = float(df["Close"].rolling(120).mean().iloc[-1]) if len(df) >= 120 else ma60
 
     if abs(move_pct) < max(1.1, range_pct * 0.22):
         regime = "range"
@@ -185,34 +233,27 @@ def market_regime(df: pd.DataFrame, current: float):
     else:
         regime = "mixed"
 
-    return {
-        "regime": regime,
-        "move_pct": move_pct,
-        "range_pct": range_pct,
-        "ma20": ma20,
-        "ma60": ma60
-    }
+    if ma20 > ma60 > ma120:
+        strength = "상승 정배열"
+    elif ma20 < ma60 < ma120:
+        strength = "하락 정배열"
+    else:
+        strength = "혼조 배열"
+
+    return {"regime": regime, "move_pct": move_pct, "range_pct": range_pct, "ma20": ma20, "ma60": ma60, "ma120": ma120, "strength": strength}
 
 
 def reaction_score_around_level(df: pd.DataFrame, level: float, tolerance: float):
-    highs = df["High"].values
-    lows = df["Low"].values
-    closes = df["Close"].values
-    volumes = df["Volume"].values
+    highs, lows, closes, volumes = df["High"].values, df["Low"].values, df["Close"].values, df["Volume"].values
     avg_volume = max(float(np.mean(volumes)), 1e-9)
-
-    touches = 0
-    rejections = 0
-    volume_score = 0.0
+    touches, rejections, volume_score = 0, 0, 0.0
 
     for i in range(len(df)):
         touched = lows[i] - tolerance <= level <= highs[i] + tolerance
         if not touched:
             continue
-
         touches += 1
         volume_score += min(volumes[i] / avg_volume, 3.0)
-
         if abs(highs[i] - level) <= tolerance and closes[i] < level:
             rejections += 1
         elif abs(lows[i] - level) <= tolerance and closes[i] > level:
@@ -255,7 +296,6 @@ def build_major_levels(df: pd.DataFrame, current: float, atr: float, pivot_highs
     for cl in clusters:
         price = cl["price"]
         touches, rejections, vol_score = reaction_score_around_level(df, price, tolerance)
-
         if touches < 2:
             continue
 
@@ -263,36 +303,17 @@ def build_major_levels(df: pd.DataFrame, current: float, atr: float, pivot_highs
         recency = recent_idx / max(len(df) - 1, 1)
         distance_pct = (price - current) / current * 100
         distance_abs = abs(distance_pct)
-
-        if distance_abs > 7.5:
+        if distance_abs > 10:
             continue
 
         pivot_count = sum(1 for x in cl["items"] if "pivot" in x["source"])
         volume_count = sum(1 for x in cl["items"] if "volume" in x["source"])
 
-        score = (
-            touches * 1.7
-            + rejections * 2.4
-            + min(vol_score, 13) * 0.45
-            + pivot_count * 1.25
-            + volume_count * 0.35
-            + recency * 2.0
-            + (1 / (1 + distance_abs / 2.2)) * 2.2
-        )
-
-        levels.append({
-            "price": price,
-            "kind": "resistance" if price >= current else "support",
-            "touches": touches,
-            "rejections": rejections,
-            "score": score,
-            "distance_pct": distance_pct
-        })
+        score = touches*1.7 + rejections*2.4 + min(vol_score, 13)*0.45 + pivot_count*1.25 + volume_count*0.35 + recency*2.0 + (1/(1+distance_abs/2.2))*2.2
+        levels.append({"price": price, "kind": "resistance" if price >= current else "support", "touches": touches, "rejections": rejections, "score": score, "distance_pct": distance_pct})
 
     levels = sorted(levels, key=lambda x: x["score"], reverse=True)
-
-    selected = []
-    min_gap = max(atr * 1.15, current * 0.0035)
+    selected, min_gap = [], max(atr * 1.15, current * 0.0035)
 
     for lv in levels:
         if all(abs(lv["price"] - s["price"]) > min_gap for s in selected):
@@ -300,172 +321,95 @@ def build_major_levels(df: pd.DataFrame, current: float, atr: float, pivot_highs
 
     supports = [x for x in selected if x["price"] < current]
     resistances = [x for x in selected if x["price"] > current]
-
-    # 추세장에서는 현재가 가까운 레벨을 더 적게, 박스권에서는 상하단을 선명하게
-    max_each = 2 if regime in {"uptrend", "downtrend"} else 3
+    max_each = 3 if regime == "range" else 2
 
     supports = sorted(supports, key=lambda x: abs(x["distance_pct"]))[:max_each]
     resistances = sorted(resistances, key=lambda x: abs(x["distance_pct"]))[:max_each]
 
-    supports = sorted(supports, key=lambda x: x["price"], reverse=True)
-    resistances = sorted(resistances, key=lambda x: x["price"])
-
-    return supports, resistances
+    return sorted(supports, key=lambda x: x["price"], reverse=True), sorted(resistances, key=lambda x: x["price"])
 
 
 def line_quality(df: pd.DataFrame, x1, y1, x2, y2, kind: str, atr: float):
     if x2 == x1:
         return -999, 0, 0
-
     current = float(df["Close"].iloc[-1])
-    slope = (y2 - y1) / (x2 - x1)
-
-    # 급경사 제거
-    slope_pct_per_bar = abs(slope) / current * 100
-    if slope_pct_per_bar > 0.055:
+    slope = (y2-y1)/(x2-x1)
+    if abs(slope)/current*100 > 0.055:
         return -999, 0, 0
-
-    intercept = y1 - slope * x1
-    tolerance = max(atr * 0.5, current * 0.0012)
-
-    touches = 0
-    violations = 0
-
+    intercept = y1 - slope*x1
+    tolerance = max(atr*0.5, current*0.0012)
+    touches, violations = 0, 0
     start = max(0, min(x1, x2))
     for i in range(start, len(df)):
-        expected = slope * i + intercept
-        high = float(df["High"].iloc[i])
-        low = float(df["Low"].iloc[i])
-
+        expected = slope*i + intercept
+        high, low = float(df["High"].iloc[i]), float(df["Low"].iloc[i])
         if kind == "support":
-            if abs(low - expected) <= tolerance:
-                touches += 1
-            if low < expected - tolerance * 1.45:
-                violations += 1
+            if abs(low-expected) <= tolerance: touches += 1
+            if low < expected - tolerance*1.45: violations += 1
         else:
-            if abs(high - expected) <= tolerance:
-                touches += 1
-            if high > expected + tolerance * 1.45:
-                violations += 1
-
-    projected = slope * (len(df) - 1) + intercept
-    dist_pct = abs(projected - current) / current * 100
-
+            if abs(high-expected) <= tolerance: touches += 1
+            if high > expected + tolerance*1.45: violations += 1
+    projected = slope*(len(df)-1) + intercept
+    dist_pct = abs(projected-current)/current*100
     if dist_pct > 4.0:
         return -999, touches, violations
-
-    score = touches * 2.0 - violations * 2.5 - dist_pct * 0.5
-
-    return score, touches, violations
+    return touches*2.0 - violations*2.5 - dist_pct*0.5, touches, violations
 
 
 def best_trendline(df: pd.DataFrame, pivots, current: float, atr: float, kind: str, regime: str):
-    if len(pivots) < 3:
+    if len(pivots) < 3 or regime == "range":
         return None
-
-    # 박스권에서는 대각선 과감히 줄임
-    if regime == "range":
-        return None
-
-    recent = pivots[-10:]
-    best = None
-
+    recent, best = pivots[-10:], None
     for a in range(len(recent)):
-        for b in range(a + 1, len(recent)):
+        for b in range(a+1, len(recent)):
             x1, dt1, y1 = recent[a]
             x2, dt2, y2 = recent[b]
-
-            if x2 - x1 < max(14, int(len(df) * 0.10)):
+            if x2-x1 < max(14, int(len(df)*0.10)):
                 continue
-
-            slope = (y2 - y1) / (x2 - x1)
-
-            # 방향성에 안 맞는 추세선 제거
-            if regime == "uptrend" and kind == "resistance":
-                continue
-            if regime == "downtrend" and kind == "support":
-                continue
-            if kind == "support" and slope <= 0:
-                continue
-            if kind == "resistance" and slope >= 0:
-                continue
-
+            slope = (y2-y1)/(x2-x1)
+            if regime == "uptrend" and kind == "resistance": continue
+            if regime == "downtrend" and kind == "support": continue
+            if kind == "support" and slope <= 0: continue
+            if kind == "resistance" and slope >= 0: continue
             score, touches, violations = line_quality(df, x1, y1, x2, y2, kind, atr)
-
             if score < 1.0 or touches < 2:
                 continue
-
-            projected = y1 + slope * ((len(df) - 1) - x1)
-
-            item = {
-                "points": [(df.index[x1], y1), (df.index[-1], projected)],
-                "score": score,
-                "touches": touches,
-                "violations": violations,
-                "slope": slope,
-                "projected": projected,
-                "kind": kind
-            }
-
+            projected = y1 + slope*((len(df)-1)-x1)
+            item = {"points": [(df.index[x1], y1), (df.index[-1], projected)], "score": score, "touches": touches, "violations": violations, "slope": slope, "projected": projected, "kind": kind}
             if best is None or item["score"] > best["score"]:
                 best = item
-
     return best
 
 
 def detect_range(df: pd.DataFrame, current: float, regime: str):
     if regime != "range":
         return None
-
     recent = df.tail(90)
     top = float(recent["High"].quantile(0.91))
     bottom = float(recent["Low"].quantile(0.09))
     width = top - bottom
-
     if width <= 0:
         return None
-
-    width_pct = width / current * 100
-
+    width_pct = width/current*100
     if width_pct > 6.5:
         return None
-
-    return {
-        "top": top,
-        "bottom": bottom,
-        "mid": (top + bottom) / 2,
-        "position": (current - bottom) / width,
-        "width_pct": width_pct
-    }
+    return {"top": top, "bottom": bottom, "mid": (top+bottom)/2, "position": (current-bottom)/width, "width_pct": width_pct}
 
 
 def analyze_structure(df: pd.DataFrame, interval: str):
     current = float(df["Close"].iloc[-1])
     atr = atr_value(df)
+    atr_pct = atr/current*100
     window = pivot_window_by_interval(interval)
-
     regime_info = market_regime(df, current)
     regime = regime_info["regime"]
-
     pivot_highs, pivot_lows = find_pivots(df, window)
     supports, resistances = build_major_levels(df, current, atr, pivot_highs, pivot_lows, regime)
-
     support_trend = best_trendline(df, pivot_lows, current, atr, "support", regime)
     resistance_trend = best_trendline(df, pivot_highs, current, atr, "resistance", regime)
-
     box = detect_range(df, current, regime)
 
-    return {
-        "current": current,
-        "atr": atr,
-        "regime": regime,
-        "regime_info": regime_info,
-        "supports": supports,
-        "resistances": resistances,
-        "support_trend": support_trend,
-        "resistance_trend": resistance_trend,
-        "box": box,
-    }
+    return {"current": current, "atr": atr, "atr_pct": atr_pct, "regime": regime, "regime_info": regime_info, "supports": supports, "resistances": resistances, "support_trend": support_trend, "resistance_trend": resistance_trend, "box": box}
 
 
 def format_price(price: float) -> str:
@@ -476,85 +420,180 @@ def format_price(price: float) -> str:
     return f"{price:,.8f}"
 
 
-def make_analysis_text(structure) -> str:
-    lines = []
+def volatility_label(atr_pct: float):
+    if atr_pct < 0.35: return "낮음"
+    if atr_pct < 0.8: return "보통"
+    if atr_pct < 1.6: return "높음"
+    return "매우 높음"
 
+
+def clamp_positive(price: float):
+    return max(price, 0.00000001)
+
+
+def nearest_level_above(current: float, levels, fallback: float):
+    above = [x["price"] for x in levels if x["price"] > current]
+    return min(above) if above else fallback
+
+
+def nearest_level_below(current: float, levels, fallback: float):
+    below = [x["price"] for x in levels if x["price"] < current]
+    return max(below) if below else fallback
+
+
+def build_trade_plan(structure, interval: str):
+    current = structure["current"]
+    atr = structure["atr"]
+    atr_pct = structure["atr_pct"]
     regime = structure["regime"]
-    if regime == "uptrend":
-        lines.append("상승 추세장: 지지선/눌림 구간 우선")
-    elif regime == "downtrend":
-        lines.append("하락 추세장: 저항선/반등 매도 구간 우선")
-    elif regime == "range":
-        lines.append("박스권: 상단·하단 반응 확인")
-    else:
-        lines.append("혼조 구간: 수평 지지/저항 우선")
+    profile = timeframe_profile(interval)
 
     supports = structure["supports"]
     resistances = structure["resistances"]
 
-    if resistances:
-        r = resistances[0]
-        lines.append(f"핵심 저항: {format_price(r['price'])} ({r['distance_pct']:+.2f}%)")
+    main_support = supports[0]["price"] if supports else current - atr * 1.5
+    main_resistance = resistances[0]["price"] if resistances else current + atr * 1.5
 
-    if supports:
-        s = supports[0]
-        lines.append(f"핵심 지지: {format_price(s['price'])} ({s['distance_pct']:+.2f}%)")
+    buffer = atr * profile["entry_buffer"]
+    sl_atr = atr * profile["sl_atr"]
+    tp1_atr = atr * profile["tp1_atr"]
+    tp2_atr = atr * profile["tp2_atr"]
 
-    box = structure["box"]
-    if box:
-        pos = box["position"]
-        if pos >= 0.72:
-            lines.append("박스 상단부: 추격 진입 주의")
-        elif pos <= 0.28:
-            lines.append("박스 하단부: 이탈/반등 확인")
-        else:
-            lines.append("박스 중단부: 방향성 애매")
+    long_entry = main_resistance + buffer
+    long_sl = min(main_support - buffer, long_entry - sl_atr)
+    long_tp1 = max(long_entry + tp1_atr, main_resistance + atr * 0.8)
+    long_tp2 = max(long_entry + tp2_atr, long_tp1 + atr * 0.8)
 
-    if structure["support_trend"]:
-        lines.append("상승 추세 지지선 유효")
-    if structure["resistance_trend"]:
-        lines.append("하락 추세 저항선 유효")
+    short_entry = main_support - buffer
+    short_sl = max(main_resistance + buffer, short_entry + sl_atr)
+    short_tp1 = min(short_entry - tp1_atr, main_support - atr * 0.8)
+    short_tp2 = min(short_entry - tp2_atr, short_tp1 - atr * 0.8)
 
-    return "\n".join(lines[:5])
+    long_rr1 = abs(long_tp1 - long_entry) / max(abs(long_entry - long_sl), 1e-9)
+    long_rr2 = abs(long_tp2 - long_entry) / max(abs(long_entry - long_sl), 1e-9)
+    short_rr1 = abs(short_entry - short_tp1) / max(abs(short_sl - short_entry), 1e-9)
+    short_rr2 = abs(short_entry - short_tp2) / max(abs(short_sl - short_entry), 1e-9)
+
+    # 구간 중간값: 여기서는 신규 진입 비추
+    mid_low = main_support + atr * 0.35
+    mid_high = main_resistance - atr * 0.35
+    in_mid_zone = mid_low < current < mid_high
+
+    if regime == "uptrend":
+        bias = "롱 우선"
+        note = "눌림 지지 확인 또는 저항 돌파 안착 시나리오 우선."
+    elif regime == "downtrend":
+        bias = "숏 우선"
+        note = "반등 저항 확인 또는 지지 이탈 시나리오 우선."
+    elif regime == "range":
+        bias = "박스 매매"
+        note = "상단 추격 롱·하단 추격 숏 주의. 상단/하단 반응 확인."
+    else:
+        bias = "중립"
+        note = "방향성 확인 전까지 돌파/이탈 확인 위주."
+
+    if atr_pct >= 1.6:
+        risk_note = "변동성 매우 높음: 손절폭 과소 설정 주의, 레버리지 축소 권장."
+    elif atr_pct >= 0.8:
+        risk_note = "변동성 높음: 진입 후 되돌림 폭 감안 필요."
+    elif atr_pct < 0.35:
+        risk_note = "변동성 낮음: 돌파 실패/휩쏘 가능성 주의."
+    else:
+        risk_note = "변동성 보통: 일반적인 ATR 기준 대응 가능."
+
+    return {
+        "profile": profile,
+        "bias": bias,
+        "note": note,
+        "risk_note": risk_note,
+        "main_support": main_support,
+        "main_resistance": main_resistance,
+        "long_entry": long_entry,
+        "long_sl": clamp_positive(long_sl),
+        "long_tp1": long_tp1,
+        "long_tp2": long_tp2,
+        "long_rr1": long_rr1,
+        "long_rr2": long_rr2,
+        "short_entry": clamp_positive(short_entry),
+        "short_sl": short_sl,
+        "short_tp1": clamp_positive(short_tp1),
+        "short_tp2": clamp_positive(short_tp2),
+        "short_rr1": short_rr1,
+        "short_rr2": short_rr2,
+        "in_mid_zone": in_mid_zone,
+        "mid_low": mid_low,
+        "mid_high": mid_high
+    }
+
+
+def strategy_text(structure, interval: str):
+    plan = build_trade_plan(structure, interval)
+    regime_info = structure["regime_info"]
+    atr_pct = structure["atr_pct"]
+
+    if structure["regime"] == "uptrend":
+        trend = "📈 상승 우세"
+    elif structure["regime"] == "downtrend":
+        trend = "📉 하락 우세"
+    elif structure["regime"] == "range":
+        trend = "📦 박스권"
+    else:
+        trend = "⚖️ 혼조"
+
+    lines = [
+        f"🧩 프레임: {plan['profile']['name']} / 예상 관리 시간 {plan['profile']['max_wait']}",
+        f"추세: {trend} · {regime_info['strength']}",
+        f"변동성: {volatility_label(atr_pct)} / ATR {format_price(structure['atr'])} ({atr_pct:.2f}%)",
+        f"방향성: <b>{plan['bias']}</b>",
+        "",
+        f"🟥 핵심 저항: <b>{format_price(plan['main_resistance'])}</b>",
+        f"🟩 핵심 지지: <b>{format_price(plan['main_support'])}</b>",
+        "",
+        "🟢 <b>롱 시나리오</b>",
+        f"진입 조건: {format_price(plan['long_entry'])} 돌파 후 안착",
+        f"TP1: {format_price(plan['long_tp1'])} / R:R {plan['long_rr1']:.2f}",
+        f"TP2: {format_price(plan['long_tp2'])} / R:R {plan['long_rr2']:.2f}",
+        f"SL 후보: {format_price(plan['long_sl'])}",
+        "",
+        "🔴 <b>숏 시나리오</b>",
+        f"진입 조건: {format_price(plan['short_entry'])} 이탈 후 저항화",
+        f"TP1: {format_price(plan['short_tp1'])} / R:R {plan['short_rr1']:.2f}",
+        f"TP2: {format_price(plan['short_tp2'])} / R:R {plan['short_rr2']:.2f}",
+        f"SL 후보: {format_price(plan['short_sl'])}",
+        "",
+        f"📌 {plan['note']}",
+        f"⚠️ {plan['risk_note']}",
+    ]
+
+    if plan["in_mid_zone"]:
+        lines.append(f"관망 구간: {format_price(plan['mid_low'])} ~ {format_price(plan['mid_high'])}")
+
+    return "\n".join(lines)
 
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Clean Drawing V4"
+    title = f"{symbol} {display_interval(interval)} | Strategy V6"
 
-    mc = mpf.make_marketcolors(
-        up="#26a69a", down="#ef5350",
-        edge="inherit", wick="inherit", volume="inherit"
-    )
-    style = mpf.make_mpf_style(
-        base_mpf_style="nightclouds",
-        marketcolors=mc,
-        gridstyle="--",
-        y_on_right=True
-    )
+    mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
 
     hlines, hcolors, hstyles, hwidths = [], [], [], []
-
     current = structure["current"]
 
-    # 현재가 라인
-    hlines.append(current)
-    hcolors.append("#ffffff")
-    hstyles.append(":")
-    hwidths.append(0.9)
+    hlines.append(current); hcolors.append("#ffffff"); hstyles.append(":"); hwidths.append(0.9)
 
-    # 수평 레벨: 너무 많이 긋지 않기
     for r in structure["resistances"][:2]:
-        hlines.append(r["price"])
-        hcolors.append("#ff5252")
-        hstyles.append("-")
-        hwidths.append(1.25)
-
+        hlines.append(r["price"]); hcolors.append("#ff5252"); hstyles.append("-"); hwidths.append(1.25)
     for s in structure["supports"][:2]:
-        hlines.append(s["price"])
-        hcolors.append("#00e676")
-        hstyles.append("-")
-        hwidths.append(1.25)
+        hlines.append(s["price"]); hcolors.append("#00e676"); hstyles.append("-"); hwidths.append(1.25)
+
+    plan = build_trade_plan(structure, interval)
+    # 전략 레벨: TP/SL는 너무 지저분해질 수 있어 얇은 점선으로만 표시
+    hlines.extend([plan["long_entry"], plan["short_entry"]])
+    hcolors.extend(["#64b5f6", "#ffb74d"])
+    hstyles.extend(["--", "--"])
+    hwidths.extend([0.8, 0.8])
 
     box = structure["box"]
     if box:
@@ -564,36 +603,16 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
         hwidths.extend([1.0, 1.0])
 
     alines, acolors, awidths = [], [], []
-
-    # 추세선은 시장 상태에 맞는 것만 1개 정도
     if structure["support_trend"]:
-        alines.append(structure["support_trend"]["points"])
-        acolors.append("#00c853")
-        awidths.append(1.45)
-
+        alines.append(structure["support_trend"]["points"]); acolors.append("#00c853"); awidths.append(1.45)
     if structure["resistance_trend"]:
-        alines.append(structure["resistance_trend"]["points"])
-        acolors.append("#ff1744")
-        awidths.append(1.45)
+        alines.append(structure["resistance_trend"]["points"]); acolors.append("#ff1744"); awidths.append(1.45)
 
     kwargs = {}
-
     if hlines:
-        kwargs["hlines"] = dict(
-            hlines=hlines,
-            colors=hcolors,
-            linestyle=hstyles,
-            linewidths=hwidths,
-            alpha=0.82
-        )
-
+        kwargs["hlines"] = dict(hlines=hlines, colors=hcolors, linestyle=hstyles, linewidths=hwidths, alpha=0.82)
     if alines:
-        kwargs["alines"] = dict(
-            alines=alines,
-            colors=acolors,
-            linewidths=awidths,
-            alpha=0.95
-        )
+        kwargs["alines"] = dict(alines=alines, colors=acolors, linewidths=awidths, alpha=0.95)
 
     mpf.plot(
         df,
@@ -607,8 +626,16 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
         savefig=dict(fname=image_path, dpi=145, bbox_inches="tight"),
         **kwargs
     )
-
     return image_path
+
+
+@app.on_event("startup")
+def startup_event():
+    try:
+        get_bitget_symbols(force=True)
+        print(f"Loaded {len(SYMBOL_CACHE['symbols'])} Bitget USDT futures symbols")
+    except Exception as e:
+        print(f"symbol preload failed: {e}")
 
 
 @app.post("/webhook/{secret}")
@@ -621,16 +648,19 @@ async def telegram_webhook(secret: str, request: Request):
     if not message:
         return {"ok": True}
 
-    text = message.get("text", "")
+    text = message.get("text", "").strip()
     chat_id = message.get("chat", {}).get("id")
-
     if not chat_id or not text.startswith("/"):
         return {"ok": True}
 
-    symbol, interval = parse_command(text)
-    shown_interval = display_interval(interval)
-
     try:
+        symbol, interval = parse_chart_command(text)
+        shown_interval = display_interval(interval)
+
+        if not is_valid_symbol(symbol):
+            send_message(chat_id, f"⚠️ <b>{symbol}</b> 는 Bitget USDT 선물 상장 심볼이 아닌 것 같아.")
+            return {"ok": True}
+
         ticker = get_bitget_ticker(symbol)
         df = get_bitget_candles(symbol, interval, limit=200)
         structure = analyze_structure(df, interval)
@@ -638,16 +668,14 @@ async def telegram_webhook(secret: str, request: Request):
 
         change = ticker["change_percent"]
         icon = "🟢" if change >= 0 else "🔴"
-        analysis_text = make_analysis_text(structure)
+        analysis = strategy_text(structure, interval)
 
         caption = (
-            f"📊 <b>{symbol} {shown_interval}</b>\n\n"
-            f"현재가: <b>{format_price(ticker['price'])}</b>\n"
-            f"24h 변동: {icon} <b>{change:.2f}%</b>\n"
-            f"캔들: <b>{len(df)}개</b>\n\n"
-            f"⚪ 현재가 / 🟥 저항 / 🟩 지지 / 🟧 박스권\n"
-            f"📌 <b>Clean 분석 V4</b>\n"
-            f"{analysis_text}"
+            f"📊 <b>{symbol} {shown_interval}</b>\n"
+            f"현재가: <b>{format_price(ticker['price'])}</b> / 24h {icon} <b>{change:.2f}%</b>\n"
+            f"⚪ 현재가 · 🟥저항 · 🟩지지 · 🔵롱트리거 · 🟧숏트리거\n\n"
+            f"{analysis}\n\n"
+            f"※ 자동 분석이며 확정 신호가 아니라 리스크 관리용 시나리오야."
         )
 
         send_photo(chat_id, image_path, caption)
@@ -660,9 +688,9 @@ async def telegram_webhook(secret: str, request: Request):
     except Exception as e:
         send_message(
             chat_id,
-            f"⚠️ <b>{symbol} {shown_interval}</b> 차트 생성 실패\n\n"
+            f"⚠️ 분석 실패\n\n"
             f"원인: <code>{str(e)[:300]}</code>\n\n"
-            f"예시: /btc, /btc 15m, /eth 1h, /sol 4h"
+            f"예시: /btc, /eth 1h, /1000pepe 15m, /wif 4h"
         )
 
     return {"ok": True}
