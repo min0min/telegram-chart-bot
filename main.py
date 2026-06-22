@@ -21,7 +21,7 @@ SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Strategy V9 Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V10 Ready"}
 
 
 @app.get("/health")
@@ -489,76 +489,124 @@ def split_entry_plan(structure, interval: str):
     support = plan["main_support"]
     resistance = plan["main_resistance"]
 
-    # 현재가가 지지/저항 사이 어디쯤 있는지
-    price_range = max(resistance - support, atr)
-    position = (current - support) / price_range
+    profile = timeframe_profile(interval)
 
-    # 변동성별 기본 비중
+    price_range = max(resistance - support, atr * 3)
+    position = (current - support) / max(price_range, 1e-9)
+
+    # 변동성 매우 높으면 애매한 분할진입 금지
     if atr_pct >= 1.6:
         return {
             "mode": "avoid",
             "lines": [
                 "🚨 <b>분할진입 판단</b>",
                 "현재 변동성이 매우 높아서 분할진입 비추천.",
-                "확인 후 1회 진입 또는 포지션 크기 축소가 우선."
+                "핵심 지지/저항 반응 확인 후 1회 진입 또는 포지션 크기 축소가 우선."
             ]
         }
 
+    # 시간봉별 분할 간격 배수
+    # 1h 이상부터는 촘촘한 분할 금지, 핵심 구간 중심으로 넓게 잡음
+    spacing_by_tf = {
+        "1m": 0.35, "3m": 0.45, "5m": 0.55,
+        "15m": 0.80, "30m": 1.05,
+        "1H": 1.35, "2H": 1.65, "4H": 2.10,
+        "6H": 2.35, "12H": 2.80,
+        "1D": 3.50, "3D": 4.50, "1W": 5.50,
+    }
+
+    spacing = atr * spacing_by_tf.get(interval, 0.80)
+
+    # 지지~저항 폭이 충분히 넓으면 구간 분할을 우선
+    # 폭이 좁으면 ATR 기준으로 넓게 벌림
+    zone_step = price_range / 3
+    step = max(spacing, zone_step * 0.75)
+
     if atr_pct >= 0.8:
         ratio = "30% / 30% / 40%"
-        gap1 = atr * 0.35
-        gap2 = atr * 0.75
-        note = "변동성 높음: 첫 진입 작게, 마지막 진입은 확인 후."
+        note = "변동성 높음: 첫 진입 작게, 마지막 진입은 핵심 구간 반응 확인 후."
     elif atr_pct < 0.35:
         ratio = "40% / 30% / 30%"
-        gap1 = atr * 0.25
-        gap2 = atr * 0.55
-        note = "저변동성: 휩쏘 가능성 때문에 돌파 추격 금지."
+        note = "저변동성: 너무 촘촘한 분할은 휩쏘에 말릴 수 있음."
     else:
         ratio = "40% / 30% / 30%"
-        gap1 = atr * 0.30
-        gap2 = atr * 0.65
-        note = "보통 변동성: 현재가 기준 3분할 접근 가능."
+        note = "보통 변동성: 시간봉 기준 넓은 3분할 접근."
 
-    # 현재가 기준 분할 후보
-    # 롱은 현재가 아래 눌림 매수 후보
+    # 롱은 현재가 밑에서만, 핵심 지지 방향으로 넓게
     long_entries = [
-        current - gap1,
-        current - gap2,
-        max(support + atr * 0.15, current - atr * 1.20)
+        current - step * 0.65,
+        current - step * 1.35,
+        max(support + atr * 0.20, current - step * 2.10)
     ]
 
-    # 숏은 현재가 위 반등 매도 후보
+    # 숏은 현재가 위에서만, 핵심 저항 방향으로 넓게
     short_entries = [
-        current + gap1,
-        current + gap2,
-        min(resistance - atr * 0.15, current + atr * 1.20)
+        current + step * 0.65,
+        current + step * 1.35,
+        min(resistance - atr * 0.20, current + step * 2.10)
     ]
 
-    # 지지/저항을 벗어나는 이상한 값 보정
-    long_entries = [max(x, support + atr * 0.05) for x in long_entries]
-    short_entries = [min(x, resistance - atr * 0.05) for x in short_entries]
+    # 핵심 지지/저항을 과하게 넘어가지 않게 제한
+    long_floor = support + atr * 0.15
+    short_ceiling = resistance - atr * 0.15
 
-    # 중복/역전 방지
+    long_entries = [max(x, long_floor) for x in long_entries]
+    short_entries = [min(x, short_ceiling) for x in short_entries]
+
+    # 만약 현재가가 하단부면 롱 분할은 지지선 중심으로 재배치
+    if position <= 0.25:
+        long_entries = [
+            current - atr * 0.45,
+            support + atr * 0.55,
+            support + atr * 0.20
+        ]
+
+    # 만약 현재가가 상단부면 숏 분할은 저항선 중심으로 재배치
+    if position >= 0.75:
+        short_entries = [
+            current + atr * 0.45,
+            resistance - atr * 0.55,
+            resistance - atr * 0.20
+        ]
+
+    # 정렬 및 중복 제거
     long_entries = sorted(set([round(x, 12) for x in long_entries]), reverse=True)
     short_entries = sorted(set([round(x, 12) for x in short_entries]))
 
-    # 3개가 안 나오면 보강
-    while len(long_entries) < 3:
-        long_entries.append(max(support + atr * 0.1, long_entries[-1] - atr * 0.25))
-    while len(short_entries) < 3:
-        short_entries.append(min(resistance - atr * 0.1, short_entries[-1] + atr * 0.25))
+    # 너무 가까운 값 제거/보정
+    min_gap = atr * spacing_by_tf.get(interval, 0.80) * 0.55
 
-    long_entries = long_entries[:3]
-    short_entries = short_entries[:3]
+    def clean_levels(levels, direction):
+        cleaned = []
+        for lv in levels:
+            if all(abs(lv - c) >= min_gap for c in cleaned):
+                cleaned.append(lv)
 
-    # 위치별 코멘트
+        while len(cleaned) < 3:
+            if not cleaned:
+                cleaned.append(current)
+            else:
+                if direction == "long":
+                    cleaned.append(cleaned[-1] - min_gap)
+                else:
+                    cleaned.append(cleaned[-1] + min_gap)
+
+        return cleaned[:3]
+
+    long_entries = clean_levels(long_entries, "long")
+    short_entries = clean_levels(short_entries, "short")
+
     if position >= 0.78:
-        zone_note = "현재가가 상단부라 롱 분할은 추격 주의. 숏은 저항 반응 확인 필요."
+        zone_note = "현재가가 상단부라 롱 분할은 추격 주의. 숏은 저항 반응 확인 중심."
     elif position <= 0.22:
-        zone_note = "현재가가 하단부라 숏 분할은 추격 주의. 롱은 지지 반응 확인 필요."
+        zone_note = "현재가가 하단부라 숏 분할은 추격 주의. 롱은 지지 반응 확인 중심."
     else:
-        zone_note = "현재가는 중간 구간이라 양방향 모두 확인 후 진입이 유리."
+        zone_note = "현재가는 중간 구간. 분할은 핵심 지지/저항 쪽으로 넓게 대기."
+
+    if interval in {"1H", "2H", "4H", "6H", "12H", "1D", "3D", "1W"}:
+        tf_note = f"{display_interval(interval)} 프레임: 촘촘한 분할보다 넓은 구간 분할 우선."
+    else:
+        tf_note = f"{display_interval(interval)} 프레임: 단기 분할 가능하나 추격 진입 주의."
 
     if regime == "uptrend":
         preferred = "우선순위: 롱 눌림 분할 > 숏 추격"
@@ -574,9 +622,10 @@ def split_entry_plan(structure, interval: str):
         "lines": [
             "🧱 <b>분할진입 계산</b>",
             f"추천 비중: <b>{ratio}</b>",
-            f"롱 눌림 후보: {format_price(long_entries[0])} / {format_price(long_entries[1])} / {format_price(long_entries[2])}",
-            f"숏 반등 후보: {format_price(short_entries[0])} / {format_price(short_entries[1])} / {format_price(short_entries[2])}",
+            f"롱 넓은 분할 후보: {format_price(long_entries[0])} / {format_price(long_entries[1])} / {format_price(long_entries[2])}",
+            f"숏 넓은 분할 후보: {format_price(short_entries[0])} / {format_price(short_entries[1])} / {format_price(short_entries[2])}",
             zone_note,
+            tf_note,
             preferred,
             note
         ]
@@ -673,7 +722,7 @@ def strategy_text(structure, interval: str):
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Strategy V9"
+    title = f"{symbol} {display_interval(interval)} | Strategy V10"
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
     hlines, hcolors, hstyles, hwidths = [], [], [], []
