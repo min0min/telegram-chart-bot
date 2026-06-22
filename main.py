@@ -21,7 +21,7 @@ SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Strategy V6 Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V7 Ready"}
 
 
 @app.get("/health")
@@ -526,10 +526,121 @@ def build_trade_plan(structure, interval: str):
     }
 
 
+def split_entry_plan(structure, interval: str):
+    plan = build_trade_plan(structure, interval)
+    current = structure["current"]
+    atr = structure["atr"]
+    atr_pct = structure["atr_pct"]
+
+    if atr_pct >= 1.6:
+        return {
+            "mode": "avoid",
+            "text": (
+                "🚨 <b>변동성 주의</b>\\n"
+                "현재 변동성이 매우 높아서 분할진입보다 돌파/이탈 확인 후 1회 진입이 더 안전해 보임.\\n"
+                "무리한 물타기식 분할진입은 비추천."
+            )
+        }
+
+    if atr_pct >= 0.8:
+        ratio = "30% / 30% / 40%"
+        gap = atr * 0.45
+        note = "변동성 높음: 마지막 진입 비중을 가장 크게 두고, 확인 후 진입 권장."
+    elif atr_pct < 0.35:
+        ratio = "50% / 30% / 20%"
+        gap = atr * 0.25
+        note = "변동성 낮음: 휩쏘 가능성이 있어 첫 진입을 과하게 크게 잡지 말 것."
+    else:
+        ratio = "40% / 30% / 30%"
+        gap = atr * 0.35
+        note = "변동성 보통: 일반적인 3분할 접근 가능."
+
+    long_entries = [
+        plan["long_entry"],
+        plan["long_entry"] - gap,
+        plan["main_support"] + gap
+    ]
+
+    short_entries = [
+        plan["short_entry"],
+        plan["short_entry"] + gap,
+        plan["main_resistance"] - gap
+    ]
+
+    # 가격 순서 보정
+    long_entries = sorted(long_entries, reverse=True)
+    short_entries = sorted(short_entries)
+
+    return {
+        "mode": "split",
+        "text": (
+            f"🧱 <b>분할진입 계산</b>\\n"
+            f"추천 비중: <b>{ratio}</b>\\n"
+            f"롱 분할 후보: {format_price(long_entries[0])} / {format_price(long_entries[1])} / {format_price(long_entries[2])}\\n"
+            f"숏 분할 후보: {format_price(short_entries[0])} / {format_price(short_entries[1])} / {format_price(short_entries[2])}\\n"
+            f"{note}"
+        )
+    }
+
+
+def signal_points(df: pd.DataFrame, structure, interval: str):
+    current = structure["current"]
+    atr = structure["atr"]
+    regime = structure["regime"]
+    supports = structure["supports"]
+    resistances = structure["resistances"]
+
+    if not supports and not resistances:
+        return [], []
+
+    support_price = supports[0]["price"] if supports else current - atr * 1.5
+    resistance_price = resistances[0]["price"] if resistances else current + atr * 1.5
+
+    tolerance = max(atr * 0.55, current * 0.0015)
+
+    long_points = []
+    short_points = []
+
+    # 최근 80개 안에서만 표기. 너무 많이 찍히면 지저분하므로 최대 3개씩.
+    start = max(1, len(df) - 80)
+
+    for i in range(start, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+
+        close = float(row["Close"])
+        open_ = float(row["Open"])
+        high = float(row["High"])
+        low = float(row["Low"])
+        prev_close = float(prev["Close"])
+
+        bullish = close > open_
+        bearish = close < open_
+
+        near_support = abs(low - support_price) <= tolerance or low <= support_price <= high
+        near_resistance = abs(high - resistance_price) <= tolerance or low <= resistance_price <= high
+
+        breakout_long = prev_close <= resistance_price and close > resistance_price and bullish
+        breakdown_short = prev_close >= support_price and close < support_price and bearish
+
+        bounce_long = near_support and bullish and close > support_price
+        reject_short = near_resistance and bearish and close < resistance_price
+
+        if regime in {"uptrend", "mixed", "range"} and (breakout_long or bounce_long):
+            long_points.append((i, low - atr * 0.45))
+
+        if regime in {"downtrend", "mixed", "range"} and (breakdown_short or reject_short):
+            short_points.append((i, high + atr * 0.45))
+
+    # 최근성 우선으로 최대 3개
+    return long_points[-3:], short_points[-3:]
+
+
 def strategy_text(structure, interval: str):
     plan = build_trade_plan(structure, interval)
     regime_info = structure["regime_info"]
     atr_pct = structure["atr_pct"]
+    split = split_entry_plan(structure, interval)
 
     if structure["regime"] == "uptrend":
         trend = "📈 상승 우세"
@@ -540,10 +651,21 @@ def strategy_text(structure, interval: str):
     else:
         trend = "⚖️ 혼조"
 
+    vol_warning = ""
+    if atr_pct >= 1.6:
+        vol_warning = "🚨 변동성 매우 높음: 손절폭 과소 설정 금지, 레버리지 축소 권장"
+    elif atr_pct >= 0.8:
+        vol_warning = "⚠️ 변동성 주의: 진입 후 흔들림 폭이 커질 수 있음"
+    elif atr_pct < 0.35:
+        vol_warning = "⚠️ 저변동성 주의: 돌파 실패/휩쏘 가능성 있음"
+    else:
+        vol_warning = "✅ 변동성 보통: ATR 기준 대응 가능"
+
     lines = [
         f"🧩 프레임: {plan['profile']['name']} / 예상 관리 시간 {plan['profile']['max_wait']}",
         f"추세: {trend} · {regime_info['strength']}",
         f"변동성: {volatility_label(atr_pct)} / ATR {format_price(structure['atr'])} ({atr_pct:.2f}%)",
+        f"{vol_warning}",
         f"방향성: <b>{plan['bias']}</b>",
         "",
         f"🟥 핵심 저항: <b>{format_price(plan['main_resistance'])}</b>",
@@ -561,6 +683,8 @@ def strategy_text(structure, interval: str):
         f"TP2: {format_price(plan['short_tp2'])} / R:R {plan['short_rr2']:.2f}",
         f"SL 후보: {format_price(plan['short_sl'])}",
         "",
+        split["text"],
+        "",
         f"📌 {plan['note']}",
         f"⚠️ {plan['risk_note']}",
     ]
@@ -568,12 +692,12 @@ def strategy_text(structure, interval: str):
     if plan["in_mid_zone"]:
         lines.append(f"관망 구간: {format_price(plan['mid_low'])} ~ {format_price(plan['mid_high'])}")
 
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Strategy V6"
+    title = f"{symbol} {display_interval(interval)} | Strategy V7"
 
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
@@ -589,7 +713,8 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
         hlines.append(s["price"]); hcolors.append("#00e676"); hstyles.append("-"); hwidths.append(1.25)
 
     plan = build_trade_plan(structure, interval)
-    # 전략 레벨: TP/SL는 너무 지저분해질 수 있어 얇은 점선으로만 표시
+
+    # 전략 트리거
     hlines.extend([plan["long_entry"], plan["short_entry"]])
     hcolors.extend(["#64b5f6", "#ffb74d"])
     hstyles.extend(["--", "--"])
@@ -614,7 +739,7 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
     if alines:
         kwargs["alines"] = dict(alines=alines, colors=acolors, linewidths=awidths, alpha=0.95)
 
-    mpf.plot(
+    fig, axes = mpf.plot(
         df,
         type="candle",
         style=style,
@@ -623,9 +748,59 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
         mav=(20, 60),
         figsize=(12, 7),
         tight_layout=True,
-        savefig=dict(fname=image_path, dpi=145, bbox_inches="tight"),
+        returnfig=True,
         **kwargs
     )
+
+    ax = axes[0]
+
+    long_pts, short_pts = signal_points(df, structure, interval)
+
+    # 이모지 폰트가 서버에서 안 잡힐 수 있어도 텔레그램 이미지에는 보통 문자로 표시됨.
+    # 실패해도 차트 생성은 계속되도록 안전 처리.
+    try:
+        for x, y in long_pts:
+            ax.text(
+                x, y, "🚀",
+                fontsize=16,
+                ha="center",
+                va="top",
+                zorder=10
+            )
+
+        for x, y in short_pts:
+            ax.text(
+                x, y, "🔻",
+                fontsize=16,
+                ha="center",
+                va="bottom",
+                zorder=10
+            )
+
+        # 우측 상단 상태 박스
+        atr_pct = structure["atr_pct"]
+        if atr_pct >= 1.6:
+            risk = "HIGH VOLATILITY"
+        elif atr_pct >= 0.8:
+            risk = "VOLATILITY CAUTION"
+        else:
+            risk = "NORMAL VOL"
+
+        ax.text(
+            0.015, 0.97,
+            f"🚀 Long zone / 🔻 Short zone\\n⚠ {risk}",
+            transform=ax.transAxes,
+            fontsize=9,
+            ha="left",
+            va="top",
+            bbox=dict(boxstyle="round,pad=0.35", fc="#111111", ec="#888888", alpha=0.72),
+            zorder=10
+        )
+
+    except Exception as e:
+        print(f"emoji annotation skipped: {e}")
+
+    fig.savefig(image_path, dpi=145, bbox_inches="tight")
     return image_path
 
 
@@ -673,9 +848,9 @@ async def telegram_webhook(secret: str, request: Request):
         caption = (
             f"📊 <b>{symbol} {shown_interval}</b>\n"
             f"현재가: <b>{format_price(ticker['price'])}</b> / 24h {icon} <b>{change:.2f}%</b>\n"
-            f"⚪ 현재가 · 🟥저항 · 🟩지지 · 🔵롱트리거 · 🟧숏트리거\n\n"
+            f"⚪ 현재가 · 🟥저항 · 🟩지지 · 🔵롱트리거 · 🟧숏트리거 · 🚀롱우세 · 🔻숏우세\n\n"
             f"{analysis}\n\n"
-            f"※ 자동 분석이며 확정 신호가 아니라 리스크 관리용 시나리오야."
+            f"※ 자동 분석이며 확정 신호가 아니라 리스크 관리용 시나리오야. 변동성 구간에서는 포지션 크기를 줄이는 게 우선."
         )
 
         send_photo(chat_id, image_path, caption)
