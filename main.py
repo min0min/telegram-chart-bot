@@ -82,13 +82,7 @@ def parse_command(text: str):
 
 
 def candle_limit_by_interval(interval: str) -> int:
-    if interval in {"1m", "3m", "5m", "15m"}:
-        return 220
-    if interval in {"30m", "1H", "2H"}:
-        return 240
-    if interval in {"4H", "6H", "12H"}:
-        return 260
-    return 300
+    return 200
 
 
 def pivot_window_by_interval(interval: str) -> int:
