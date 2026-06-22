@@ -19,7 +19,7 @@ BITGET_API = "https://api.bitget.com"
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Drawing V3 Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Drawing V4 Ready"}
 
 
 @app.get("/health")
@@ -156,17 +156,42 @@ def find_pivots(df: pd.DataFrame, window: int):
     h, l = df["High"].values, df["Low"].values
 
     for i in range(window, len(df) - window):
-        left_h = h[i-window:i]
-        right_h = h[i+1:i+window+1]
-        left_l = l[i-window:i]
-        right_l = l[i+1:i+window+1]
-
-        if h[i] > max(left_h) and h[i] >= max(right_h):
+        if h[i] > max(h[i-window:i]) and h[i] >= max(h[i+1:i+window+1]):
             highs.append((i, df.index[i], float(h[i])))
-        if l[i] < min(left_l) and l[i] <= min(right_l):
+        if l[i] < min(l[i-window:i]) and l[i] <= min(l[i+1:i+window+1]):
             lows.append((i, df.index[i], float(l[i])))
 
     return highs, lows
+
+
+def market_regime(df: pd.DataFrame, current: float):
+    recent = df.tail(55)
+    start = float(recent["Close"].iloc[0])
+    end = float(recent["Close"].iloc[-1])
+    move_pct = (end - start) / current * 100
+    high = float(recent["High"].max())
+    low = float(recent["Low"].min())
+    range_pct = (high - low) / current * 100
+
+    ma20 = float(df["Close"].rolling(20).mean().iloc[-1])
+    ma60 = float(df["Close"].rolling(60).mean().iloc[-1])
+
+    if abs(move_pct) < max(1.1, range_pct * 0.22):
+        regime = "range"
+    elif move_pct > 0 and ma20 >= ma60:
+        regime = "uptrend"
+    elif move_pct < 0 and ma20 <= ma60:
+        regime = "downtrend"
+    else:
+        regime = "mixed"
+
+    return {
+        "regime": regime,
+        "move_pct": move_pct,
+        "range_pct": range_pct,
+        "ma20": ma20,
+        "ma60": ma60
+    }
 
 
 def reaction_score_around_level(df: pd.DataFrame, level: float, tolerance: float):
@@ -174,11 +199,11 @@ def reaction_score_around_level(df: pd.DataFrame, level: float, tolerance: float
     lows = df["Low"].values
     closes = df["Close"].values
     volumes = df["Volume"].values
+    avg_volume = max(float(np.mean(volumes)), 1e-9)
 
     touches = 0
     rejections = 0
     volume_score = 0.0
-    avg_volume = max(float(np.mean(volumes)), 1e-9)
 
     for i in range(len(df)):
         touched = lows[i] - tolerance <= level <= highs[i] + tolerance
@@ -188,49 +213,37 @@ def reaction_score_around_level(df: pd.DataFrame, level: float, tolerance: float
         touches += 1
         volume_score += min(volumes[i] / avg_volume, 3.0)
 
-        candle_range = max(highs[i] - lows[i], 1e-9)
-        body_mid = (df["Open"].iloc[i] + closes[i]) / 2
-
-        # 위에서 맞고 밀림 = 저항 반응, 아래에서 맞고 반등 = 지지 반응
         if abs(highs[i] - level) <= tolerance and closes[i] < level:
             rejections += 1
         elif abs(lows[i] - level) <= tolerance and closes[i] > level:
             rejections += 1
-        elif abs(body_mid - level) <= tolerance * 0.7:
-            rejections += 0.25
 
     return touches, rejections, volume_score
 
 
-def build_major_levels(df: pd.DataFrame, current: float, atr: float, pivot_highs, pivot_lows):
-    tolerance = max(atr * 0.42, current * 0.0012)
+def build_major_levels(df: pd.DataFrame, current: float, atr: float, pivot_highs, pivot_lows, regime: str):
+    tolerance = max(atr * 0.45, current * 0.0013)
     candidates = []
 
-    # 1) 피벗 기반 후보
     for idx, dt, price in pivot_highs:
         candidates.append({"price": price, "source": "pivot_high", "idx": idx})
     for idx, dt, price in pivot_lows:
         candidates.append({"price": price, "source": "pivot_low", "idx": idx})
 
-    # 2) 거래량 터진 캔들의 고가/저가/종가 후보 추가
-    vol_threshold = df["Volume"].quantile(0.88)
+    vol_threshold = df["Volume"].quantile(0.90)
     for i, row in enumerate(df.itertuples()):
         if row.Volume >= vol_threshold:
             candidates.append({"price": float(row.High), "source": "volume_high", "idx": i})
             candidates.append({"price": float(row.Low), "source": "volume_low", "idx": i})
             candidates.append({"price": float(row.Close), "source": "volume_close", "idx": i})
 
-    if not candidates:
-        return [], []
-
-    # 3) 후보 가격대 클러스터링
     clusters = []
     for c in candidates:
         placed = False
         for cl in clusters:
             if abs(c["price"] - cl["price"]) <= tolerance:
                 cl["items"].append(c)
-                weights = [2.0 if "pivot" in x["source"] else 1.2 for x in cl["items"]]
+                weights = [2.0 if "pivot" in x["source"] else 1.15 for x in cl["items"]]
                 prices = [x["price"] for x in cl["items"]]
                 cl["price"] = float(np.average(prices, weights=weights))
                 placed = True
@@ -243,106 +256,115 @@ def build_major_levels(df: pd.DataFrame, current: float, atr: float, pivot_highs
         price = cl["price"]
         touches, rejections, vol_score = reaction_score_around_level(df, price, tolerance)
 
+        if touches < 2:
+            continue
+
         recent_idx = max(x["idx"] for x in cl["items"])
         recency = recent_idx / max(len(df) - 1, 1)
-        distance = abs(price - current) / current * 100
-        distance_score = 1 / (1 + distance / 2.5)
+        distance_pct = (price - current) / current * 100
+        distance_abs = abs(distance_pct)
+
+        if distance_abs > 7.5:
+            continue
 
         pivot_count = sum(1 for x in cl["items"] if "pivot" in x["source"])
         volume_count = sum(1 for x in cl["items"] if "volume" in x["source"])
 
-        # 실제 반응 + 거래량 + 최근성 + 현재가 근처를 종합
         score = (
-            touches * 1.8
-            + rejections * 2.2
-            + min(vol_score, 14) * 0.45
-            + pivot_count * 1.3
-            + volume_count * 0.45
+            touches * 1.7
+            + rejections * 2.4
+            + min(vol_score, 13) * 0.45
+            + pivot_count * 1.25
+            + volume_count * 0.35
             + recency * 2.0
-            + distance_score * 2.2
+            + (1 / (1 + distance_abs / 2.2)) * 2.2
         )
 
-        if touches < 2:
-            continue
-
-        kind = "resistance" if price >= current else "support"
         levels.append({
             "price": price,
-            "kind": kind,
+            "kind": "resistance" if price >= current else "support",
             "touches": touches,
             "rejections": rejections,
             "score": score,
-            "distance_pct": (price - current) / current * 100
+            "distance_pct": distance_pct
         })
 
-    # 4) 너무 가까운 선 제거: 같은 구역 선은 최고 점수 1개만
     levels = sorted(levels, key=lambda x: x["score"], reverse=True)
-    selected = []
 
-    min_gap = max(atr * 0.75, current * 0.0025)
+    selected = []
+    min_gap = max(atr * 1.15, current * 0.0035)
 
     for lv in levels:
         if all(abs(lv["price"] - s["price"]) > min_gap for s in selected):
             selected.append(lv)
 
-    supports = sorted(
-        [x for x in selected if x["price"] < current],
-        key=lambda x: (abs(x["distance_pct"]), -x["score"])
-    )[:3]
+    supports = [x for x in selected if x["price"] < current]
+    resistances = [x for x in selected if x["price"] > current]
 
-    resistances = sorted(
-        [x for x in selected if x["price"] > current],
-        key=lambda x: (abs(x["distance_pct"]), -x["score"])
-    )[:3]
+    # 추세장에서는 현재가 가까운 레벨을 더 적게, 박스권에서는 상하단을 선명하게
+    max_each = 2 if regime in {"uptrend", "downtrend"} else 3
 
-    # 가까운 순으로 표시하되, 너무 쓰레기 점수는 제외
+    supports = sorted(supports, key=lambda x: abs(x["distance_pct"]))[:max_each]
+    resistances = sorted(resistances, key=lambda x: abs(x["distance_pct"]))[:max_each]
+
     supports = sorted(supports, key=lambda x: x["price"], reverse=True)
     resistances = sorted(resistances, key=lambda x: x["price"])
 
     return supports, resistances
 
 
-def line_error(df: pd.DataFrame, line, kind: str, atr: float):
-    x1, y1, x2, y2 = line
+def line_quality(df: pd.DataFrame, x1, y1, x2, y2, kind: str, atr: float):
     if x2 == x1:
-        return 1e9, 0
+        return -999, 0, 0
+
+    current = float(df["Close"].iloc[-1])
     slope = (y2 - y1) / (x2 - x1)
+
+    # 급경사 제거
+    slope_pct_per_bar = abs(slope) / current * 100
+    if slope_pct_per_bar > 0.055:
+        return -999, 0, 0
+
     intercept = y1 - slope * x1
+    tolerance = max(atr * 0.5, current * 0.0012)
 
     touches = 0
     violations = 0
-    total_error = 0.0
-    tolerance = max(atr * 0.45, np.mean(df["Close"]) * 0.001)
 
     start = max(0, min(x1, x2))
-    end = len(df) - 1
-
-    for i in range(start, end + 1):
+    for i in range(start, len(df)):
         expected = slope * i + intercept
         high = float(df["High"].iloc[i])
         low = float(df["Low"].iloc[i])
 
         if kind == "support":
-            dist = abs(low - expected)
-            if dist <= tolerance:
+            if abs(low - expected) <= tolerance:
                 touches += 1
-            if low < expected - tolerance * 1.35:
+            if low < expected - tolerance * 1.45:
                 violations += 1
-            total_error += min(dist / tolerance, 3)
         else:
-            dist = abs(high - expected)
-            if dist <= tolerance:
+            if abs(high - expected) <= tolerance:
                 touches += 1
-            if high > expected + tolerance * 1.35:
+            if high > expected + tolerance * 1.45:
                 violations += 1
-            total_error += min(dist / tolerance, 3)
 
-    avg_error = total_error / max(end - start + 1, 1)
-    return avg_error + violations * 1.5 - touches * 0.35, touches
+    projected = slope * (len(df) - 1) + intercept
+    dist_pct = abs(projected - current) / current * 100
+
+    if dist_pct > 4.0:
+        return -999, touches, violations
+
+    score = touches * 2.0 - violations * 2.5 - dist_pct * 0.5
+
+    return score, touches, violations
 
 
-def best_trendline(df: pd.DataFrame, pivots, current: float, atr: float, kind: str):
+def best_trendline(df: pd.DataFrame, pivots, current: float, atr: float, kind: str, regime: str):
     if len(pivots) < 3:
+        return None
+
+    # 박스권에서는 대각선 과감히 줄임
+    if regime == "range":
         return None
 
     recent = pivots[-10:]
@@ -353,72 +375,66 @@ def best_trendline(df: pd.DataFrame, pivots, current: float, atr: float, kind: s
             x1, dt1, y1 = recent[a]
             x2, dt2, y2 = recent[b]
 
-            if x2 - x1 < max(12, len(df) * 0.08):
+            if x2 - x1 < max(14, int(len(df) * 0.10)):
                 continue
 
             slope = (y2 - y1) / (x2 - x1)
 
-            # 15m 같은 단기봉에서 터무니없는 대각선 제거
-            slope_pct_per_bar = abs(slope) / current * 100
-            if slope_pct_per_bar > 0.08:
+            # 방향성에 안 맞는 추세선 제거
+            if regime == "uptrend" and kind == "resistance":
+                continue
+            if regime == "downtrend" and kind == "support":
+                continue
+            if kind == "support" and slope <= 0:
+                continue
+            if kind == "resistance" and slope >= 0:
                 continue
 
-            err, touches = line_error(df, (x1, y1, x2, y2), kind, atr)
+            score, touches, violations = line_quality(df, x1, y1, x2, y2, kind, atr)
+
+            if score < 1.0 or touches < 2:
+                continue
+
             projected = y1 + slope * ((len(df) - 1) - x1)
-            dist_pct = abs(projected - current) / current * 100
 
-            # 현재가와 너무 먼 추세선 제거
-            if dist_pct > 4.5:
-                continue
+            item = {
+                "points": [(df.index[x1], y1), (df.index[-1], projected)],
+                "score": score,
+                "touches": touches,
+                "violations": violations,
+                "slope": slope,
+                "projected": projected,
+                "kind": kind
+            }
 
-            score = touches * 2.0 - err - dist_pct * 0.35
-
-            # 방향성 가중치
-            if kind == "support" and slope > 0:
-                score += 1.0
-            if kind == "resistance" and slope < 0:
-                score += 1.0
-
-            if touches < 2:
-                continue
-
-            if best is None or score > best["score"]:
-                best = {
-                    "points": [(df.index[x1], y1), (df.index[-1], projected)],
-                    "score": score,
-                    "touches": touches,
-                    "slope": slope,
-                    "projected": projected,
-                    "kind": kind
-                }
+            if best is None or item["score"] > best["score"]:
+                best = item
 
     return best
 
 
-def detect_range(df: pd.DataFrame, current: float, atr: float):
+def detect_range(df: pd.DataFrame, current: float, regime: str):
+    if regime != "range":
+        return None
+
     recent = df.tail(90)
-    highs = recent["High"]
-    lows = recent["Low"]
-    top = float(highs.quantile(0.90))
-    bottom = float(lows.quantile(0.10))
+    top = float(recent["High"].quantile(0.91))
+    bottom = float(recent["Low"].quantile(0.09))
     width = top - bottom
 
     if width <= 0:
         return None
 
     width_pct = width / current * 100
-    trend_move_pct = abs(float(recent["Close"].iloc[-1] - recent["Close"].iloc[0])) / current * 100
 
-    # 박스권은 폭은 적당하고, 기간 시작~끝 이동이 과하지 않아야 함
-    if width_pct > 7.0 or trend_move_pct > width_pct * 0.85:
+    if width_pct > 6.5:
         return None
 
-    pos = (current - bottom) / width
     return {
         "top": top,
         "bottom": bottom,
         "mid": (top + bottom) / 2,
-        "position": pos,
+        "position": (current - bottom) / width,
         "width_pct": width_pct
     }
 
@@ -428,25 +444,27 @@ def analyze_structure(df: pd.DataFrame, interval: str):
     atr = atr_value(df)
     window = pivot_window_by_interval(interval)
 
+    regime_info = market_regime(df, current)
+    regime = regime_info["regime"]
+
     pivot_highs, pivot_lows = find_pivots(df, window)
+    supports, resistances = build_major_levels(df, current, atr, pivot_highs, pivot_lows, regime)
 
-    supports, resistances = build_major_levels(df, current, atr, pivot_highs, pivot_lows)
+    support_trend = best_trendline(df, pivot_lows, current, atr, "support", regime)
+    resistance_trend = best_trendline(df, pivot_highs, current, atr, "resistance", regime)
 
-    support_trend = best_trendline(df, pivot_lows, current, atr, "support")
-    resistance_trend = best_trendline(df, pivot_highs, current, atr, "resistance")
-
-    box = detect_range(df, current, atr)
+    box = detect_range(df, current, regime)
 
     return {
         "current": current,
         "atr": atr,
+        "regime": regime,
+        "regime_info": regime_info,
         "supports": supports,
         "resistances": resistances,
         "support_trend": support_trend,
         "resistance_trend": resistance_trend,
         "box": box,
-        "pivot_highs": pivot_highs,
-        "pivot_lows": pivot_lows
     }
 
 
@@ -459,54 +477,55 @@ def format_price(price: float) -> str:
 
 
 def make_analysis_text(structure) -> str:
-    current = structure["current"]
-    supports = structure["supports"]
-    resistances = structure["resistances"]
-    box = structure["box"]
-
     lines = []
 
-    if box:
-        pos = box["position"]
-        if pos >= 0.72:
-            lines.append("박스 상단 접근: 추격 진입 주의")
-        elif pos <= 0.28:
-            lines.append("박스 하단 접근: 반등/이탈 확인 구간")
-        else:
-            lines.append("박스 중단부: 방향성 애매")
+    regime = structure["regime"]
+    if regime == "uptrend":
+        lines.append("상승 추세장: 지지선/눌림 구간 우선")
+    elif regime == "downtrend":
+        lines.append("하락 추세장: 저항선/반등 매도 구간 우선")
+    elif regime == "range":
+        lines.append("박스권: 상단·하단 반응 확인")
+    else:
+        lines.append("혼조 구간: 수평 지지/저항 우선")
+
+    supports = structure["supports"]
+    resistances = structure["resistances"]
 
     if resistances:
         r = resistances[0]
-        lines.append(f"주요 저항: {format_price(r['price'])} ({r['distance_pct']:+.2f}%)")
+        lines.append(f"핵심 저항: {format_price(r['price'])} ({r['distance_pct']:+.2f}%)")
 
     if supports:
         s = supports[0]
-        lines.append(f"주요 지지: {format_price(s['price'])} ({s['distance_pct']:+.2f}%)")
+        lines.append(f"핵심 지지: {format_price(s['price'])} ({s['distance_pct']:+.2f}%)")
+
+    box = structure["box"]
+    if box:
+        pos = box["position"]
+        if pos >= 0.72:
+            lines.append("박스 상단부: 추격 진입 주의")
+        elif pos <= 0.28:
+            lines.append("박스 하단부: 이탈/반등 확인")
+        else:
+            lines.append("박스 중단부: 방향성 애매")
 
     if structure["support_trend"]:
-        lines.append("상승 추세 지지선 감지")
+        lines.append("상승 추세 지지선 유효")
     if structure["resistance_trend"]:
-        lines.append("하락/상단 추세 저항선 감지")
-
-    if not lines:
-        lines.append("현재 구간은 명확한 핵심 레벨 부족")
+        lines.append("하락 추세 저항선 유효")
 
     return "\n".join(lines[:5])
 
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-
-    title = f"{symbol} {display_interval(interval)} | Smart Drawing V3"
+    title = f"{symbol} {display_interval(interval)} | Clean Drawing V4"
 
     mc = mpf.make_marketcolors(
-        up="#26a69a",
-        down="#ef5350",
-        edge="inherit",
-        wick="inherit",
-        volume="inherit"
+        up="#26a69a", down="#ef5350",
+        edge="inherit", wick="inherit", volume="inherit"
     )
-
     style = mpf.make_mpf_style(
         base_mpf_style="nightclouds",
         marketcolors=mc,
@@ -516,18 +535,26 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
 
     hlines, hcolors, hstyles, hwidths = [], [], [], []
 
-    # 가까운 주요 레벨만 표시
-    for r in structure["resistances"]:
+    current = structure["current"]
+
+    # 현재가 라인
+    hlines.append(current)
+    hcolors.append("#ffffff")
+    hstyles.append(":")
+    hwidths.append(0.9)
+
+    # 수평 레벨: 너무 많이 긋지 않기
+    for r in structure["resistances"][:2]:
         hlines.append(r["price"])
         hcolors.append("#ff5252")
         hstyles.append("-")
-        hwidths.append(1.35 if r["score"] > 10 else 1.0)
+        hwidths.append(1.25)
 
-    for s in structure["supports"]:
+    for s in structure["supports"][:2]:
         hlines.append(s["price"])
         hcolors.append("#00e676")
         hstyles.append("-")
-        hwidths.append(1.35 if s["score"] > 10 else 1.0)
+        hwidths.append(1.25)
 
     box = structure["box"]
     if box:
@@ -538,15 +565,16 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
 
     alines, acolors, awidths = [], [], []
 
-    if structure["resistance_trend"]:
-        alines.append(structure["resistance_trend"]["points"])
-        acolors.append("#ff1744")
-        awidths.append(1.4)
-
+    # 추세선은 시장 상태에 맞는 것만 1개 정도
     if structure["support_trend"]:
         alines.append(structure["support_trend"]["points"])
         acolors.append("#00c853")
-        awidths.append(1.4)
+        awidths.append(1.45)
+
+    if structure["resistance_trend"]:
+        alines.append(structure["resistance_trend"]["points"])
+        acolors.append("#ff1744")
+        awidths.append(1.45)
 
     kwargs = {}
 
@@ -590,7 +618,6 @@ async def telegram_webhook(secret: str, request: Request):
 
     update = await request.json()
     message = update.get("message") or update.get("edited_message")
-
     if not message:
         return {"ok": True}
 
@@ -611,7 +638,6 @@ async def telegram_webhook(secret: str, request: Request):
 
         change = ticker["change_percent"]
         icon = "🟢" if change >= 0 else "🔴"
-
         analysis_text = make_analysis_text(structure)
 
         caption = (
@@ -619,8 +645,8 @@ async def telegram_webhook(secret: str, request: Request):
             f"현재가: <b>{format_price(ticker['price'])}</b>\n"
             f"24h 변동: {icon} <b>{change:.2f}%</b>\n"
             f"캔들: <b>{len(df)}개</b>\n\n"
-            f"🟥 주요 저항 / 🟩 주요 지지 / 🟧 박스권\n"
-            f"📌 <b>Smart 분석 V3</b>\n"
+            f"⚪ 현재가 / 🟥 저항 / 🟩 지지 / 🟧 박스권\n"
+            f"📌 <b>Clean 분석 V4</b>\n"
             f"{analysis_text}"
         )
 
