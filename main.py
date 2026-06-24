@@ -22,7 +22,7 @@ SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Strategy V14 Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V15 Ready"}
 
 
 @app.get("/health")
@@ -766,21 +766,54 @@ def final_action(structure, interval: str):
     long_ok = score["long_decision"] in {"진입 가능", "소액/축소 진입"}
     short_ok = score["short_decision"] in {"진입 가능", "소액/축소 진입"}
 
+    # 방향 우위와 진입 품질을 분리해서 판단
+    direction_gap = abs(score["long_score"] - score["short_score"])
+
+    if score["long_score"] > score["short_score"] + 8:
+        direction = "롱 방향 우위"
+    elif score["short_score"] > score["long_score"] + 8:
+        direction = "숏 방향 우위"
+    else:
+        direction = "방향성 애매"
+
     if quality < 45:
+        if direction == "롱 방향 우위":
+            return "🟡 LONG 관점 / NO TRADE", "롱 근거는 있지만 진입 품질이 낮아 신규 진입은 비추천."
+        if direction == "숏 방향 우위":
+            return "🟡 SHORT 관점 / NO TRADE", "숏 근거는 있지만 진입 품질이 낮아 신규 진입은 비추천."
         return "🚫 NO TRADE", "시장 품질이 낮아서 신규 진입보다 관망이 유리."
+
     if structure["atr_pct"] >= 1.6 and quality < 75:
+        if direction == "롱 방향 우위":
+            return "🟡 LONG 관점 / 변동성 주의", "롱 방향성은 있으나 변동성이 매우 높아 확인 후 접근 필요."
+        if direction == "숏 방향 우위":
+            return "🟡 SHORT 관점 / 변동성 주의", "숏 방향성은 있으나 변동성이 매우 높아 확인 후 접근 필요."
         return "🚫 NO TRADE", "변동성이 매우 높아 손절 흔들림이 커질 가능성이 높음."
+
     if plan["long_rr1"] < 1.0 and plan["short_rr1"] < 1.0:
+        if direction == "롱 방향 우위":
+            return "🟡 LONG 관점 / RR 부족", "롱 방향성은 있으나 TP1 손익비가 부족해 추격 진입은 비추천."
+        if direction == "숏 방향 우위":
+            return "🟡 SHORT 관점 / RR 부족", "숏 방향성은 있으나 TP1 손익비가 부족해 추격 진입은 비추천."
         return "🚫 NO TRADE", "롱/숏 모두 TP1 기준 손익비가 불리함."
+
     if score["final"] == "롱 우세" and long_ok:
         if plan["in_mid_zone"]:
             return "🟡 LONG 대기", "롱 우세지만 현재가는 중간값이라 눌림 확인 후 접근."
         return "🟢 LONG 우세", "롱 확률과 손익비가 상대적으로 우위."
+
     if score["final"] == "숏 우세" and short_ok:
         if plan["in_mid_zone"]:
             return "🟡 SHORT 대기", "숏 우세지만 현재가는 중간값이라 반등 확인 후 접근."
         return "🔴 SHORT 우세", "숏 확률과 손익비가 상대적으로 우위."
+
+    if direction == "롱 방향 우위":
+        return "🟡 LONG 관점 / 관망", "롱 근거가 더 많지만 진입 조건이 아직 부족함."
+    if direction == "숏 방향 우위":
+        return "🟡 SHORT 관점 / 관망", "숏 근거가 더 많지만 진입 조건이 아직 부족함."
+
     return "🟡 관망 우선", "확률 우위 또는 손익비가 충분하지 않아 확인이 더 필요."
+
 
 
 def ai_commentary(structure, interval: str):
@@ -790,8 +823,12 @@ def ai_commentary(structure, interval: str):
 
     comments = []
 
-    if action.startswith("🚫"):
-        comments.append("현재 구간은 진입보다 리스크 관리가 우선이야.")
+    if "LONG 관점" in action:
+        comments.append("방향성은 롱 쪽 근거가 더 많지만, 현재 구간은 진입 품질이 낮아서 바로 추격하기보다 눌림이나 안착 확인이 필요해.")
+    elif "SHORT 관점" in action:
+        comments.append("방향성은 숏 쪽 근거가 더 많지만, 현재 구간은 진입 품질이 낮아서 바로 추격하기보다 반등 저항이나 이탈 확인이 필요해.")
+    elif action.startswith("🚫"):
+        comments.append("현재 구간은 방향성보다 리스크 관리가 우선이야.")
     elif "LONG" in action:
         comments.append("롱 관점은 유효하지만, 추격보다는 안착 확인이 중요해.")
     elif "SHORT" in action:
@@ -811,6 +848,7 @@ def ai_commentary(structure, interval: str):
         comments.append("리스크 요인: " + " / ".join(score["risk_reasons"][:2]))
 
     return " ".join(comments)
+
 
 
 def strategy_text(structure, interval: str):
@@ -843,15 +881,15 @@ def strategy_text(structure, interval: str):
 
     lines = [
         "━━━━━━━━━━━━━━",
-        "📊 <b>전략 분석 V14</b>",
+        "📊 <b>전략 분석 V15</b>",
         "━━━━━━━━━━━━━━",
         "",
         f"🎯 <b>최종 행동</b>: {action}",
         f"└ {action_reason}",
         "",
         f"🏆 <b>Trade Quality</b>: {quality:.0f}/100 ({grade})",
-        f"🟢 롱 확률: <b>{score['long_prob']}%</b> · {score['long_score']:.0f}점 ({score['long_grade']})",
-        f"🔴 숏 확률: <b>{score['short_prob']}%</b> · {score['short_score']:.0f}점 ({score['short_grade']})",
+        f"🟢 롱 방향 우위: <b>{score['long_prob']}%</b> · {score['long_score']:.0f}점 ({score['long_grade']})",
+        f"🔴 숏 방향 우위: <b>{score['short_prob']}%</b> · {score['short_score']:.0f}점 ({score['short_grade']})",
         "",
         "━━━━━━━━━━━━━━",
         "🧭 <b>시장 상태</b>",
@@ -913,18 +951,13 @@ def strategy_text(structure, interval: str):
     if plan["in_mid_zone"]:
         lines.extend(["", f"관망 구간: {format_price(plan['mid_low'])} ~ {format_price(plan['mid_high'])}"])
 
-    lines.extend([
-        "",
-        "※ 자동 분석이며 확정 신호가 아니라 리스크 관리용 시나리오야."
-    ])
-
     return "\n".join(lines)
 
 
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Strategy V14"
+    title = f"{symbol} {display_interval(interval)} | Strategy V15"
 
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
