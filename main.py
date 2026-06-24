@@ -22,7 +22,7 @@ SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Strategy V18 Final Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V18.1.1.1 Stable Ready"}
 
 
 @app.get("/health")
@@ -776,9 +776,20 @@ def rr_grade(rr: float):
     return "나쁨"
 
 
+def capped_rr(rr: float):
+    # 실전 표시용 상한. 계산 폭주 방지.
+    return min(max(rr, 0), 5.0)
+
+
+def capped_ev(ev: float):
+    # 실전 표시용 상한. 과대 기대값 방지.
+    return max(min(ev, 3.0), -3.0)
+
+
 def expected_value(prob_pct: float, rr: float):
     p = max(0, min(1, prob_pct / 100))
-    return p * rr - (1 - p)
+    rr = capped_rr(rr)
+    return capped_ev(p * rr - (1 - p))
 
 
 def score_components(structure, interval: str):
@@ -796,7 +807,6 @@ def score_components(structure, interval: str):
     long = {"trend": 0, "ema": 0, "sr": 0, "rr": 0, "volatility": 0, "momentum": 0}
     short = {"trend": 0, "ema": 0, "sr": 0, "rr": 0, "volatility": 0, "momentum": 0}
 
-    # 1) Trend 20
     if regime == "uptrend":
         long["trend"], short["trend"] = 20, 5
     elif regime == "downtrend":
@@ -806,7 +816,6 @@ def score_components(structure, interval: str):
     else:
         long["trend"], short["trend"] = 8, 8
 
-    # 2) EMA 15
     if ma20 > ma60 > ma120:
         long["ema"], short["ema"] = 15, 3
     elif ma20 < ma60 < ma120:
@@ -818,7 +827,6 @@ def score_components(structure, interval: str):
     else:
         long["ema"], short["ema"] = 7, 7
 
-    # 3) SR 20
     if supports:
         s = supports[0]
         dist_s = abs((current - s["price"]) / current * 100)
@@ -838,8 +846,8 @@ def score_components(structure, interval: str):
     long["sr"] = min(20, long["sr"])
     short["sr"] = min(20, short["sr"])
 
-    # 4) Breakout RR 20
     def rr_points(rr):
+        rr = capped_rr(rr)
         if rr >= 2.2:
             return 20
         if rr >= 1.6:
@@ -853,7 +861,6 @@ def score_components(structure, interval: str):
     long["rr"] = rr_points(plan["long_rr1"])
     short["rr"] = rr_points(plan["short_rr1"])
 
-    # 5) Volatility 10
     if atr_pct < 0.35:
         vol_points = 5
     elif atr_pct < 0.8:
@@ -866,7 +873,6 @@ def score_components(structure, interval: str):
     long["volatility"] = vol_points
     short["volatility"] = vol_points
 
-    # 6) Momentum 15
     if move > 0:
         long["momentum"] = min(15, 8 + abs(move) * 1.2)
         short["momentum"] = max(2, 8 - abs(move) * 0.8)
@@ -899,7 +905,6 @@ def pullback_plan(structure, interval: str, side: str):
     plan = build_trade_plan(structure, interval)
     atr = structure["atr"]
 
-    # 시간봉이 클수록 넓게
     spacing_by_tf = {
         "1m": 0.45, "3m": 0.60, "5m": 0.75,
         "15m": 1.00, "30m": 1.25,
@@ -969,7 +974,6 @@ def probability_score(structure, interval: str):
     long_prob = round(long_score / total * 100)
     short_prob = 100 - long_prob
 
-    # Bias threshold 강화: 15% 미만 차이는 NEUTRAL
     if long_prob - short_prob >= 15:
         bias = "LONG BIAS"
     elif short_prob - long_prob >= 15:
@@ -1082,11 +1086,16 @@ def best_entry_plan(structure, interval: str):
             "sl": None,
             "rr1": None,
             "rr2": None,
+            "rr1_display": None,
+            "rr2_display": None,
             "ev": None,
             "text": "방향 우위가 약해 BEST ENTRY 계산보다 관망이 우선."
         }
 
-    ev = expected_value(prob, p["rr1"])
+    raw_ev = expected_value(prob, p["rr1"])
+    rr1_display = capped_rr(p["rr1"])
+    rr2_display = capped_rr(p["rr2"])
+    ev_display = capped_ev(raw_ev)
 
     return {
         "side": p["side"],
@@ -1098,7 +1107,9 @@ def best_entry_plan(structure, interval: str):
         "sl": p["sl"],
         "rr1": p["rr1"],
         "rr2": p["rr2"],
-        "ev": ev,
+        "rr1_display": rr1_display,
+        "rr2_display": rr2_display,
+        "ev": ev_display,
         "text": f"{mode} 기준 넓은 3분할 후보"
     }
 
@@ -1110,59 +1121,76 @@ def trade_quality(structure, interval: str):
 
     if score["bias"] == "LONG BIAS":
         best_score = score["long_score"]
-        best_rr = best["rr1"] if best["side"] != "NO TRADE" else plan["long_rr1"]
+        best_rr = best["rr1_display"] if best["side"] != "NO TRADE" else plan["long_rr1"]
         best_ev = best["ev"] if best["side"] != "NO TRADE" else score["long_ev"]
+        best_prob = score["long_prob"]
     elif score["bias"] == "SHORT BIAS":
         best_score = score["short_score"]
-        best_rr = best["rr1"] if best["side"] != "NO TRADE" else plan["short_rr1"]
+        best_rr = best["rr1_display"] if best["side"] != "NO TRADE" else plan["short_rr1"]
         best_ev = best["ev"] if best["side"] != "NO TRADE" else score["short_ev"]
+        best_prob = score["short_prob"]
     else:
         best_score = max(score["long_score"], score["short_score"])
         best_rr = max(plan["long_rr1"], plan["short_rr1"])
         best_ev = max(score["long_ev"], score["short_ev"])
+        best_prob = max(score["long_prob"], score["short_prob"])
 
-    quality = 40.0
-    quality += (best_score - 50) * 0.45
+    quality = 38.0
+    quality += (best_score - 50) * 0.42
 
-    if best_rr >= 3.0:
-        quality += 24
+    if best_rr >= 4.0:
+        quality += 18
+    elif best_rr >= 3.0:
+        quality += 15
     elif best_rr >= 2.2:
-        quality += 20
+        quality += 12
     elif best_rr >= 1.6:
-        quality += 14
+        quality += 9
     elif best_rr >= 1.1:
-        quality += 7
+        quality += 5
     else:
         quality -= 8
 
-    if best_ev >= 2.0:
-        quality += 24
-    elif best_ev >= 1.0:
-        quality += 18
-    elif best_ev >= 0.35:
-        quality += 12
-    elif best_ev >= 0.05:
-        quality += 5
+    if best_ev >= 2.5:
+        quality += 16
+    elif best_ev >= 1.5:
+        quality += 13
+    elif best_ev >= 0.7:
+        quality += 9
+    elif best_ev >= 0.15:
+        quality += 4
     else:
         quality -= 8
 
     atr_pct = structure["atr_pct"]
     if atr_pct >= 1.6:
-        quality -= 7
+        quality -= 9
     elif atr_pct >= 0.8:
-        quality -= 4
+        quality -= 5
     elif atr_pct < 0.35:
         quality -= 4
 
     if structure["regime"] in {"uptrend", "downtrend"}:
-        quality += 5
+        quality += 4
     elif structure["regime"] == "range":
-        quality -= 2
+        quality -= 3
 
     if plan["in_mid_zone"]:
         quality -= 4
 
-    quality = max(0, min(100, quality))
+    # 과대평가 방지: 방향 점수와 확률에 따른 상한
+    if best_score < 80:
+        quality = min(quality, 88)
+    if best_score < 75:
+        quality = min(quality, 82)
+    if best_prob < 85:
+        quality = min(quality, 88)
+    if best_prob < 75:
+        quality = min(quality, 78)
+    if atr_pct >= 1.6:
+        quality = min(quality, 86)
+
+    quality = max(0, min(95, quality))
     return quality, score_grade(quality)
 
 
@@ -1175,11 +1203,13 @@ def final_action(structure, interval: str):
         return "🟠 WATCH", "롱/숏 방향 차이가 작아 신규 진입보다 방향 확인 우선."
 
     best_ev = best["ev"] if best["side"] != "NO TRADE" else -999
-    best_rr = best["rr1"] if best["side"] != "NO TRADE" else 0
+    best_rr = best["rr1_display"] if best["side"] != "NO TRADE" else 0
+    best_prob = score["long_prob"] if score["bias"] == "LONG BIAS" else score["short_prob"]
 
-    if quality >= 90 and best_ev >= 2.0 and best_rr >= 2.2:
+    # STRONG ENTRY는 정말 강한 구간만
+    if quality >= 90 and best_prob >= 88 and best_ev >= 2.0 and best_rr >= 2.2:
         return "🔥 STRONG ENTRY", "방향성·손익비·기대값이 모두 강하게 우위."
-    if quality >= 80 and best_ev >= 1.0 and best_rr >= 1.6:
+    if quality >= 80 and best_prob >= 70 and best_ev >= 1.0 and best_rr >= 1.6:
         return "🟢 ENTRY OK", "진입 품질이 높지만 변동성에 맞춰 비중 조절 필요."
     if quality >= 70 and best_ev >= 0.35:
         if score["bias"] == "LONG BIAS":
@@ -1215,7 +1245,7 @@ def ai_commentary(structure, interval: str):
         comments.append("현재는 롱/숏 방향 차이가 크지 않아서 관망이 우선이야.")
 
     if best["side"] != "NO TRADE":
-        comments.append(f"{best['mode']} 기준 RR1은 {best['rr1']:.2f}, EV는 {best['ev']:+.2f}R로 계산돼.")
+        comments.append(f"{best['mode']} 기준 표시 RR1은 {best['rr1_display']:.2f}, EV는 {best['ev']:+.2f}R로 계산돼.")
 
     comments.append(f"추천도는 {quality/10:.1f}/10 수준이야.")
 
@@ -1239,7 +1269,6 @@ def ai_commentary(structure, interval: str):
 
 def strategy_text(structure, interval: str):
     plan = build_trade_plan(structure, interval)
-    split = split_entry_plan(structure, interval)
     score = probability_score(structure, interval)
     quality, grade = trade_quality(structure, interval)
     action, action_reason = final_action(structure, interval)
@@ -1270,7 +1299,7 @@ def strategy_text(structure, interval: str):
 
     lines = [
         "━━━━━━━━━━━━━━",
-        "📊 <b>실전 모드 V18</b>",
+        "📊 <b>실전 모드 V18.1.1</b>",
         "━━━━━━━━━━━━━━",
         "",
         f"🎯 <b>행동</b>: {action}",
@@ -1318,9 +1347,10 @@ def strategy_text(structure, interval: str):
             f"TP1: {format_price(best['tp1'])}",
             f"TP2: {format_price(best['tp2'])}",
             f"SL: {format_price(best['sl'])}",
-            f"BEST RR1: {best['rr1']:.2f} ({rr_grade(best['rr1'])})",
-            f"BEST RR2: {best['rr2']:.2f} ({rr_grade(best['rr2'])})",
+            f"BEST RR1: {best['rr1_display']:.2f} ({rr_grade(best['rr1_display'])})",
+            f"BEST RR2: {best['rr2_display']:.2f} ({rr_grade(best['rr2_display'])})",
             f"BEST EV: {best['ev']:+.2f}R",
+            "※ RR/EV는 과대평가 방지를 위해 표시 상한을 적용함.",
         ])
 
     lines.extend([
@@ -1360,11 +1390,6 @@ def strategy_text(structure, interval: str):
     lines.extend([
         "",
         "━━━━━━━━━━━━━━",
-        "🧱 <b>분할진입</b>",
-        "━━━━━━━━━━━━━━",
-        *split["lines"][1:],
-        "",
-        "━━━━━━━━━━━━━━",
         "🧠 <b>실전 코멘트</b>",
         "━━━━━━━━━━━━━━",
         ai_commentary(structure, interval),
@@ -1378,7 +1403,7 @@ def strategy_text(structure, interval: str):
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Strategy V18"
+    title = f"{symbol} {display_interval(interval)} | Strategy V18.1.1"
 
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
