@@ -22,7 +22,7 @@ SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Strategy V11 Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V14 Ready"}
 
 
 @app.get("/health")
@@ -702,9 +702,126 @@ def probability_score(structure, interval: str):
     return {"long_score": long_score, "short_score": short_score, "long_prob": long_prob, "short_prob": short_prob, "long_grade": score_grade(long_score), "short_grade": score_grade(short_score), "long_decision": long_decision, "short_decision": short_decision, "long_decision_reason": long_decision_reason, "short_decision_reason": short_decision_reason, "final": final, "long_reasons": long_reasons[:4], "short_reasons": short_reasons[:4], "risk_reasons": list(dict.fromkeys(risk_reasons))[:4]}
 
 
+def trade_quality(structure, interval: str):
+    plan = build_trade_plan(structure, interval)
+    score = probability_score(structure, interval)
+
+    atr_pct = structure["atr_pct"]
+    regime = structure["regime"]
+
+    best_score = max(score["long_score"], score["short_score"])
+    best_rr = max(plan["long_rr1"], plan["short_rr1"])
+
+    quality = 50.0
+
+    quality += (best_score - 50) * 0.65
+
+    if best_rr >= 2.0:
+        quality += 18
+    elif best_rr >= 1.5:
+        quality += 12
+    elif best_rr >= 1.1:
+        quality += 5
+    else:
+        quality -= 18
+
+    if atr_pct >= 1.6:
+        quality -= 18
+    elif atr_pct >= 0.8:
+        quality -= 7
+    elif atr_pct < 0.35:
+        quality -= 5
+
+    if regime == "range":
+        quality -= 4
+    elif regime in {"uptrend", "downtrend"}:
+        quality += 6
+
+    if plan["in_mid_zone"]:
+        quality -= 8
+
+    quality = max(0, min(100, quality))
+
+    if quality >= 85:
+        grade = "A+"
+    elif quality >= 75:
+        grade = "A"
+    elif quality >= 65:
+        grade = "B+"
+    elif quality >= 55:
+        grade = "B"
+    elif quality >= 45:
+        grade = "C"
+    else:
+        grade = "D"
+
+    return quality, grade
+
+
+def final_action(structure, interval: str):
+    plan = build_trade_plan(structure, interval)
+    score = probability_score(structure, interval)
+    quality, grade = trade_quality(structure, interval)
+
+    long_ok = score["long_decision"] in {"진입 가능", "소액/축소 진입"}
+    short_ok = score["short_decision"] in {"진입 가능", "소액/축소 진입"}
+
+    if quality < 45:
+        return "🚫 NO TRADE", "시장 품질이 낮아서 신규 진입보다 관망이 유리."
+    if structure["atr_pct"] >= 1.6 and quality < 75:
+        return "🚫 NO TRADE", "변동성이 매우 높아 손절 흔들림이 커질 가능성이 높음."
+    if plan["long_rr1"] < 1.0 and plan["short_rr1"] < 1.0:
+        return "🚫 NO TRADE", "롱/숏 모두 TP1 기준 손익비가 불리함."
+    if score["final"] == "롱 우세" and long_ok:
+        if plan["in_mid_zone"]:
+            return "🟡 LONG 대기", "롱 우세지만 현재가는 중간값이라 눌림 확인 후 접근."
+        return "🟢 LONG 우세", "롱 확률과 손익비가 상대적으로 우위."
+    if score["final"] == "숏 우세" and short_ok:
+        if plan["in_mid_zone"]:
+            return "🟡 SHORT 대기", "숏 우세지만 현재가는 중간값이라 반등 확인 후 접근."
+        return "🔴 SHORT 우세", "숏 확률과 손익비가 상대적으로 우위."
+    return "🟡 관망 우선", "확률 우위 또는 손익비가 충분하지 않아 확인이 더 필요."
+
+
+def ai_commentary(structure, interval: str):
+    plan = build_trade_plan(structure, interval)
+    score = probability_score(structure, interval)
+    action, reason = final_action(structure, interval)
+
+    comments = []
+
+    if action.startswith("🚫"):
+        comments.append("현재 구간은 진입보다 리스크 관리가 우선이야.")
+    elif "LONG" in action:
+        comments.append("롱 관점은 유효하지만, 추격보다는 안착 확인이 중요해.")
+    elif "SHORT" in action:
+        comments.append("숏 관점은 유효하지만, 반등 저항 확인 없이 추격하면 위험해.")
+    else:
+        comments.append("현재는 방향성보다 확인 구간이 더 중요해.")
+
+    if structure["atr_pct"] >= 1.6:
+        comments.append("ATR이 매우 높아서 평소보다 손절폭과 레버리지를 보수적으로 잡는 게 좋아.")
+    elif structure["atr_pct"] >= 0.8:
+        comments.append("변동성이 큰 편이라 분할 진입은 넓게 잡는 게 유리해.")
+
+    if plan["in_mid_zone"]:
+        comments.append("현재가는 지지와 저항 사이 중간값에 가까워서 신규 진입 기대값이 애매할 수 있어.")
+
+    if score["risk_reasons"]:
+        comments.append("리스크 요인: " + " / ".join(score["risk_reasons"][:2]))
+
+    return " ".join(comments)
+
+
 def strategy_text(structure, interval: str):
-    plan, split, score = build_trade_plan(structure, interval), split_entry_plan(structure, interval), probability_score(structure, interval)
-    regime_info, atr_pct = structure["regime_info"], structure["atr_pct"]
+    plan = build_trade_plan(structure, interval)
+    split = split_entry_plan(structure, interval)
+    score = probability_score(structure, interval)
+    quality, grade = trade_quality(structure, interval)
+    action, action_reason = final_action(structure, interval)
+
+    regime_info = structure["regime_info"]
+    atr_pct = structure["atr_pct"]
 
     if structure["regime"] == "uptrend":
         trend = "📈 상승 우세"
@@ -716,41 +833,61 @@ def strategy_text(structure, interval: str):
         trend = "⚖️ 혼조"
 
     if atr_pct >= 1.6:
-        vol_warning = "🚨 변동성 매우 높음: 레버리지 축소 권장"
+        vol_warning = "🚨 매우 높음 — 레버리지 축소 / 손절폭 과소 설정 금지"
     elif atr_pct >= 0.8:
-        vol_warning = "⚠️ 변동성 주의: 흔들림 폭 감안"
+        vol_warning = "⚠️ 높음 — 진입 후 흔들림 폭 감안"
     elif atr_pct < 0.35:
-        vol_warning = "⚠️ 저변동성: 휩쏘 가능성"
+        vol_warning = "⚠️ 낮음 — 돌파 실패·휩쏘 주의"
     else:
-        vol_warning = "✅ 변동성 보통"
+        vol_warning = "✅ 보통 — ATR 기준 대응 가능"
 
     lines = [
-        "📊 <b>전략 분석 V11</b>", "",
-        f"최종 판단: <b>{score['final']}</b>",
-        f"롱 확률: <b>{score['long_prob']}%</b> / 점수 {score['long_score']:.0f}점 ({score['long_grade']})",
-        f"숏 확률: <b>{score['short_prob']}%</b> / 점수 {score['short_score']:.0f}점 ({score['short_grade']})", "",
+        "━━━━━━━━━━━━━━",
+        "📊 <b>전략 분석 V14</b>",
+        "━━━━━━━━━━━━━━",
+        "",
+        f"🎯 <b>최종 행동</b>: {action}",
+        f"└ {action_reason}",
+        "",
+        f"🏆 <b>Trade Quality</b>: {quality:.0f}/100 ({grade})",
+        f"🟢 롱 확률: <b>{score['long_prob']}%</b> · {score['long_score']:.0f}점 ({score['long_grade']})",
+        f"🔴 숏 확률: <b>{score['short_prob']}%</b> · {score['short_score']:.0f}점 ({score['short_grade']})",
+        "",
+        "━━━━━━━━━━━━━━",
+        "🧭 <b>시장 상태</b>",
+        "━━━━━━━━━━━━━━",
         f"프레임: <b>{plan['profile']['name']}</b>",
         f"관리 시간: {plan['profile']['max_wait']}",
         f"추세: {trend} · {regime_info['strength']}",
         f"변동성: {volatility_label(atr_pct)} / ATR {format_price(structure['atr'])} ({atr_pct:.2f}%)",
-        vol_warning, "",
+        f"{vol_warning}",
+        "",
         f"🟥 핵심 저항: <b>{format_price(plan['main_resistance'])}</b>",
-        f"🟩 핵심 지지: <b>{format_price(plan['main_support'])}</b>", "",
+        f"🟩 핵심 지지: <b>{format_price(plan['main_support'])}</b>",
+        "",
+        "━━━━━━━━━━━━━━",
         "🟢 <b>롱 시나리오</b>",
-        f"진입 판단: <b>{score['long_decision']}</b>",
+        "━━━━━━━━━━━━━━",
+        f"판단: <b>{score['long_decision']}</b>",
         f"진입: {format_price(plan['long_entry'])} 돌파 후 안착",
         f"TP1: {format_price(plan['long_tp1'])} / R:R {plan['long_rr1']:.2f} ({rr_grade(plan['long_rr1'])})",
         f"TP2: {format_price(plan['long_tp2'])} / R:R {plan['long_rr2']:.2f} ({rr_grade(plan['long_rr2'])})",
         f"SL: {format_price(plan['long_sl'])}",
-        f"└ {score['long_decision_reason']}", "",
+        f"이유: {score['long_decision_reason']}",
+        "",
+        "━━━━━━━━━━━━━━",
         "🔴 <b>숏 시나리오</b>",
-        f"진입 판단: <b>{score['short_decision']}</b>",
+        "━━━━━━━━━━━━━━",
+        f"판단: <b>{score['short_decision']}</b>",
         f"진입: {format_price(plan['short_entry'])} 이탈 후 저항화",
         f"TP1: {format_price(plan['short_tp1'])} / R:R {plan['short_rr1']:.2f} ({rr_grade(plan['short_rr1'])})",
         f"TP2: {format_price(plan['short_tp2'])} / R:R {plan['short_rr2']:.2f} ({rr_grade(plan['short_rr2'])})",
         f"SL: {format_price(plan['short_sl'])}",
-        f"└ {score['short_decision_reason']}", "",
+        f"이유: {score['short_decision_reason']}",
+        "",
+        "━━━━━━━━━━━━━━",
         "📌 <b>근거</b>",
+        "━━━━━━━━━━━━━━",
     ]
 
     if score["long_reasons"]:
@@ -760,15 +897,34 @@ def strategy_text(structure, interval: str):
     if score["risk_reasons"]:
         lines.append("리스크: " + " / ".join(score["risk_reasons"]))
 
-    lines.extend(["", *split["lines"], "", f"📌 {plan['note']}", f"⚠️ {plan['risk_note']}"])
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━",
+        "🧱 <b>분할진입</b>",
+        "━━━━━━━━━━━━━━",
+        *split["lines"][1:],
+        "",
+        "━━━━━━━━━━━━━━",
+        "🧠 <b>AI 코멘트</b>",
+        "━━━━━━━━━━━━━━",
+        ai_commentary(structure, interval),
+    ])
+
     if plan["in_mid_zone"]:
         lines.extend(["", f"관망 구간: {format_price(plan['mid_low'])} ~ {format_price(plan['mid_high'])}"])
+
+    lines.extend([
+        "",
+        "※ 자동 분석이며 확정 신호가 아니라 리스크 관리용 시나리오야."
+    ])
+
     return "\n".join(lines)
+
 
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Strategy V11"
+    title = f"{symbol} {display_interval(interval)} | Strategy V14"
 
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
@@ -822,7 +978,7 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
 
     atr_pct = structure["atr_pct"]
     risk = "HIGH VOLATILITY" if atr_pct >= 1.6 else ("VOLATILITY CAUTION" if atr_pct >= 0.8 else "NORMAL VOL")
-    ax.text(0.015, 0.97, f"{score['final']}\nL {score['long_prob']}% / S {score['short_prob']}%\n{risk}", transform=ax.transAxes, fontsize=9, ha="left", va="top", color="white", bbox=dict(boxstyle="round,pad=0.35", fc="#111111", ec="#888888", alpha=0.72), zorder=12)
+    ax.text(0.015, 0.97, f"{final_action(structure, interval)[0]}\nQ {trade_quality(structure, interval)[0]:.0f}/100\nL {score['long_prob']}% / S {score['short_prob']}%\n{risk}", transform=ax.transAxes, fontsize=9, ha="left", va="top", color="white", bbox=dict(boxstyle="round,pad=0.35", fc="#111111", ec="#888888", alpha=0.72), zorder=12)
 
     fig.savefig(image_path, dpi=145, bbox_inches="tight")
     return image_path
