@@ -22,7 +22,7 @@ SYMBOL_CACHE = {"symbols": set(), "updated_at": 0}
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Telegram Chart Bot Strategy V17 Accuracy Ready"}
+    return {"status": "ok", "message": "Telegram Chart Bot Strategy V18 Final Ready"}
 
 
 @app.get("/health")
@@ -704,48 +704,66 @@ def probability_score(structure, interval: str):
 
 def position_context(structure):
     current = structure["current"]
-    support = structure["supports"][0]["price"] if structure["supports"] else current - structure["atr"] * 1.5
-    resistance = structure["resistances"][0]["price"] if structure["resistances"] else current + structure["atr"] * 1.5
+    atr = structure["atr"]
 
-    width = max(resistance - support, structure["atr"] * 2)
-    pos = (current - support) / max(width, 1e-9)
-    pos = max(0, min(1, pos))
+    support = structure["supports"][0]["price"] if structure["supports"] else current - atr * 2.0
+    resistance = structure["resistances"][0]["price"] if structure["resistances"] else current + atr * 2.0
 
-    if pos >= 0.80:
-        label = "상단부"
-        note = "저항 근처라 추격 진입 주의"
-    elif pos <= 0.20:
-        label = "하단부"
-        note = "지지 근처라 반응 확인 중요"
-    elif 0.40 <= pos <= 0.60:
-        label = "중간값"
-        note = "기대값이 애매한 구간"
+    width = max(resistance - support, atr * 2.0)
+    raw_pos = (current - support) / max(width, 1e-9)
+    pos = max(0, min(1, raw_pos))
+    pct = pos * 100
+
+    if pct <= 20:
+        label = "🟢 하단부"
+        note = "지지 근처라 롱 반응 확인 중요"
+    elif pct <= 40:
+        label = "🟢 하단중립"
+        note = "지지권에서 조금 올라온 구간"
+    elif pct <= 60:
+        label = "⚪ 중립"
+        note = "지지와 저항 중간이라 기대값 애매"
+    elif pct <= 80:
+        label = "🟠 상단중립"
+        note = "저항권에 가까워지는 구간"
     else:
-        label = "중립 구간"
-        note = "방향 확인 필요"
+        label = "🔴 상단부"
+        note = "저항 근처라 추격 진입 주의"
 
     return {
         "support": support,
         "resistance": resistance,
         "position": pos,
-        "position_pct": pos * 100,
+        "position_pct": pct,
         "label": label,
         "note": note
     }
 
 
 def score_grade(score: float):
-    if score >= 85:
+    if score >= 90:
         return "S"
-    if score >= 75:
+    if score >= 80:
         return "A"
-    if score >= 65:
+    if score >= 70:
         return "B+"
-    if score >= 55:
+    if score >= 60:
         return "B"
-    if score >= 45:
+    if score >= 50:
         return "C"
     return "D"
+
+
+def star_rating(quality: float):
+    if quality >= 90:
+        return "⭐⭐⭐⭐⭐"
+    if quality >= 80:
+        return "⭐⭐⭐⭐"
+    if quality >= 70:
+        return "⭐⭐⭐"
+    if quality >= 60:
+        return "⭐⭐"
+    return "⭐"
 
 
 def rr_grade(rr: float):
@@ -800,7 +818,7 @@ def score_components(structure, interval: str):
     else:
         long["ema"], short["ema"] = 7, 7
 
-    # 3) Support/Resistance position 20
+    # 3) SR 20
     if supports:
         s = supports[0]
         dist_s = abs((current - s["price"]) / current * 100)
@@ -820,7 +838,7 @@ def score_components(structure, interval: str):
     long["sr"] = min(20, long["sr"])
     short["sr"] = min(20, short["sr"])
 
-    # 4) RR 20: breakout plan 기준
+    # 4) Breakout RR 20
     def rr_points(rr):
         if rr >= 2.2:
             return 20
@@ -843,7 +861,7 @@ def score_components(structure, interval: str):
     elif atr_pct < 1.6:
         vol_points = 6
     else:
-        vol_points = 2
+        vol_points = 3
 
     long["volatility"] = vol_points
     short["volatility"] = vol_points
@@ -870,7 +888,7 @@ def component_lines(comp):
         "trend": "추세",
         "ema": "EMA",
         "sr": "지지/저항",
-        "rr": "손익비",
+        "rr": "돌파 손익비",
         "volatility": "변동성",
         "momentum": "모멘텀",
     }
@@ -879,19 +897,30 @@ def component_lines(comp):
 
 def pullback_plan(structure, interval: str, side: str):
     plan = build_trade_plan(structure, interval)
-    current = structure["current"]
     atr = structure["atr"]
+
+    # 시간봉이 클수록 넓게
+    spacing_by_tf = {
+        "1m": 0.45, "3m": 0.60, "5m": 0.75,
+        "15m": 1.00, "30m": 1.25,
+        "1H": 1.60, "2H": 1.90, "4H": 2.30,
+        "6H": 2.60, "12H": 3.00,
+        "1D": 1.50, "3D": 2.20, "1W": 3.00,
+    }
+    step = atr * spacing_by_tf.get(interval, 1.0)
 
     if side == "LONG":
         support = plan["main_support"]
+        base = max(support + atr * 0.20, structure["current"] - step)
         levels = [
-            support + atr * 0.85,
-            support + atr * 0.45,
-            support + atr * 0.20
+            base,
+            max(support + atr * 0.10, base - step * 0.75),
+            max(support + atr * 0.05, base - step * 1.50),
         ]
         levels = sorted(set([round(x, 12) for x in levels]), reverse=True)
         while len(levels) < 3:
-            levels.append(levels[-1] - atr * 0.25)
+            levels.append(levels[-1] - step * 0.50)
+
         weights = [0.4, 0.3, 0.3]
         avg = sum(l * w for l, w in zip(levels[:3], weights))
         tp1 = plan["long_tp1"]
@@ -899,16 +928,19 @@ def pullback_plan(structure, interval: str, side: str):
         sl = plan["long_sl"]
         rr1 = max(tp1 - avg, 0) / max(avg - sl, 1e-9)
         rr2 = max(tp2 - avg, 0) / max(avg - sl, 1e-9)
+
     else:
         resistance = plan["main_resistance"]
+        base = min(resistance - atr * 0.20, structure["current"] + step)
         levels = [
-            resistance - atr * 0.85,
-            resistance - atr * 0.45,
-            resistance - atr * 0.20
+            base,
+            min(resistance - atr * 0.10, base + step * 0.75),
+            min(resistance - atr * 0.05, base + step * 1.50),
         ]
         levels = sorted(set([round(x, 12) for x in levels]))
         while len(levels) < 3:
-            levels.append(levels[-1] + atr * 0.25)
+            levels.append(levels[-1] + step * 0.50)
+
         weights = [0.4, 0.3, 0.3]
         avg = sum(l * w for l, w in zip(levels[:3], weights))
         tp1 = plan["short_tp1"]
@@ -937,17 +969,24 @@ def probability_score(structure, interval: str):
     long_prob = round(long_score / total * 100)
     short_prob = 100 - long_prob
 
-    # Direction EV: breakout 기준. 실제 눌림 EV는 best_entry_plan에서 별도 표기.
+    # Bias threshold 강화: 15% 미만 차이는 NEUTRAL
+    if long_prob - short_prob >= 15:
+        bias = "LONG BIAS"
+    elif short_prob - long_prob >= 15:
+        bias = "SHORT BIAS"
+    else:
+        bias = "NEUTRAL"
+
     long_ev = expected_value(long_prob, plan["long_rr1"])
     short_ev = expected_value(short_prob, plan["short_rr1"])
 
     def decision(score, rr, atr_pct, ev):
-        if atr_pct >= 1.6 and score < 75:
-            return "진입 비추천", "변동성이 매우 높고 점수 우위가 충분하지 않음."
         if rr < 1.0:
-            return "진입 비추천", "돌파 진입 기준 TP1 손익비가 1 미만."
+            return "진입 비추천", "돌파/이탈 기준 TP1 손익비가 1 미만."
         if ev < 0:
-            return "진입 비추천", "돌파 진입 기준 기대값이 음수."
+            return "진입 비추천", "돌파/이탈 기준 기대값이 음수."
+        if atr_pct >= 1.6 and score < 75:
+            return "고위험 대기", "변동성이 매우 높아 확인 후 접근 필요."
         if score >= 75 and rr >= 1.3 and ev > 0.25:
             return "진입 가능", "점수·손익비·기대값이 모두 양호함."
         if score >= 65 and rr >= 1.1 and ev > 0.05:
@@ -966,7 +1005,6 @@ def probability_score(structure, interval: str):
         risk_reasons.append("변동성 높음")
     elif structure["atr_pct"] < 0.35:
         risk_reasons.append("저변동성 휩쏘 가능성")
-
     if plan["long_rr1"] < 1.0:
         risk_reasons.append("롱 돌파 TP1 손익비 1 미만")
     if plan["short_rr1"] < 1.0:
@@ -999,13 +1037,6 @@ def probability_score(structure, interval: str):
     if short_comp["momentum"] >= 11:
         short_reasons.append("하락 모멘텀 우위")
 
-    if long_score > short_score + 8:
-        bias = "LONG BIAS"
-    elif short_score > long_score + 8:
-        bias = "SHORT BIAS"
-    else:
-        bias = "NEUTRAL"
-
     return {
         "long_score": long_score,
         "short_score": short_score,
@@ -1029,109 +1060,17 @@ def probability_score(structure, interval: str):
     }
 
 
-def trade_quality(structure, interval: str):
-    plan = build_trade_plan(structure, interval)
-    score = probability_score(structure, interval)
-
-    if score["bias"] == "LONG BIAS":
-        best_side = "LONG"
-        best_score = score["long_score"]
-        breakout_rr = plan["long_rr1"]
-        pullback = pullback_plan(structure, interval, "LONG")
-    elif score["bias"] == "SHORT BIAS":
-        best_side = "SHORT"
-        best_score = score["short_score"]
-        breakout_rr = plan["short_rr1"]
-        pullback = pullback_plan(structure, interval, "SHORT")
-    else:
-        best_side = "NEUTRAL"
-        best_score = max(score["long_score"], score["short_score"])
-        breakout_rr = max(plan["long_rr1"], plan["short_rr1"])
-        pullback = None
-
-    pullback_rr = pullback["rr1"] if pullback else 0
-    best_rr = max(breakout_rr, pullback_rr)
-    best_prob = score["long_prob"] if best_side == "LONG" else score["short_prob"] if best_side == "SHORT" else max(score["long_prob"], score["short_prob"])
-    ev = expected_value(best_prob, best_rr)
-
-    quality = 35.0
-    quality += (best_score - 50) * 0.55
-
-    if best_rr >= 2.2:
-        quality += 22
-    elif best_rr >= 1.6:
-        quality += 16
-    elif best_rr >= 1.1:
-        quality += 8
-    else:
-        quality -= 10
-
-    if ev > 0.8:
-        quality += 20
-    elif ev > 0.35:
-        quality += 14
-    elif ev > 0.05:
-        quality += 7
-    else:
-        quality -= 8
-
-    atr_pct = structure["atr_pct"]
-    if atr_pct >= 1.6:
-        quality -= 10
-    elif atr_pct >= 0.8:
-        quality -= 5
-    elif atr_pct < 0.35:
-        quality -= 4
-
-    if structure["regime"] in {"uptrend", "downtrend"}:
-        quality += 6
-    elif structure["regime"] == "range":
-        quality -= 3
-
-    if plan["in_mid_zone"]:
-        quality -= 5
-
-    quality = max(0, min(100, quality))
-    return quality, score_grade(quality)
-
-
-def final_action(structure, interval: str):
-    score = probability_score(structure, interval)
-    quality, grade = trade_quality(structure, interval)
-    plan = build_trade_plan(structure, interval)
-
-    if score["bias"] == "LONG BIAS":
-        pullback = pullback_plan(structure, interval, "LONG")
-        if quality >= 70 and pullback["rr1"] >= 1.6:
-            if plan["in_mid_zone"]:
-                return "🟡 LONG 눌림 대기", "롱 방향 우위. 현재는 중간값이라 눌림 지지 확인 후 접근."
-            return "🟢 LONG 우세", "롱 방향·눌림 손익비·기대값이 우위."
-        if quality >= 45:
-            return "🟡 LONG WATCH", "롱 방향성은 있으나 현재 진입보다 눌림 확인이 유리."
-        return "🟡 LONG BIAS / NO TRADE", "롱 방향성은 있으나 품질·변동성 조건이 부족함."
-
-    if score["bias"] == "SHORT BIAS":
-        pullback = pullback_plan(structure, interval, "SHORT")
-        if quality >= 70 and pullback["rr1"] >= 1.6:
-            if plan["in_mid_zone"]:
-                return "🟡 SHORT 반등 대기", "숏 방향 우위. 현재는 중간값이라 반등 저항 확인 후 접근."
-            return "🔴 SHORT 우세", "숏 방향·반등 손익비·기대값이 우위."
-        if quality >= 45:
-            return "🟡 SHORT WATCH", "숏 방향성은 있으나 현재 진입보다 반등 확인이 유리."
-        return "🟡 SHORT BIAS / NO TRADE", "숏 방향성은 있으나 품질·변동성 조건이 부족함."
-
-    return "🟠 관망", "롱/숏 점수 차이가 크지 않아 방향 확인 필요."
-
-
 def best_entry_plan(structure, interval: str):
     score = probability_score(structure, interval)
 
     if score["bias"] == "LONG BIAS":
         p = pullback_plan(structure, interval, "LONG")
         mode = "눌림형 LONG"
+        prob = score["long_prob"]
     elif score["bias"] == "SHORT BIAS":
         p = pullback_plan(structure, interval, "SHORT")
         mode = "반등형 SHORT"
+        prob = score["short_prob"]
     else:
         return {
             "side": "NO TRADE",
@@ -1147,7 +1086,6 @@ def best_entry_plan(structure, interval: str):
             "text": "방향 우위가 약해 BEST ENTRY 계산보다 관망이 우선."
         }
 
-    prob = score["long_prob"] if p["side"] == "LONG" else score["short_prob"]
     ev = expected_value(prob, p["rr1"])
 
     return {
@@ -1165,6 +1103,93 @@ def best_entry_plan(structure, interval: str):
     }
 
 
+def trade_quality(structure, interval: str):
+    score = probability_score(structure, interval)
+    best = best_entry_plan(structure, interval)
+    plan = build_trade_plan(structure, interval)
+
+    if score["bias"] == "LONG BIAS":
+        best_score = score["long_score"]
+        best_rr = best["rr1"] if best["side"] != "NO TRADE" else plan["long_rr1"]
+        best_ev = best["ev"] if best["side"] != "NO TRADE" else score["long_ev"]
+    elif score["bias"] == "SHORT BIAS":
+        best_score = score["short_score"]
+        best_rr = best["rr1"] if best["side"] != "NO TRADE" else plan["short_rr1"]
+        best_ev = best["ev"] if best["side"] != "NO TRADE" else score["short_ev"]
+    else:
+        best_score = max(score["long_score"], score["short_score"])
+        best_rr = max(plan["long_rr1"], plan["short_rr1"])
+        best_ev = max(score["long_ev"], score["short_ev"])
+
+    quality = 40.0
+    quality += (best_score - 50) * 0.45
+
+    if best_rr >= 3.0:
+        quality += 24
+    elif best_rr >= 2.2:
+        quality += 20
+    elif best_rr >= 1.6:
+        quality += 14
+    elif best_rr >= 1.1:
+        quality += 7
+    else:
+        quality -= 8
+
+    if best_ev >= 2.0:
+        quality += 24
+    elif best_ev >= 1.0:
+        quality += 18
+    elif best_ev >= 0.35:
+        quality += 12
+    elif best_ev >= 0.05:
+        quality += 5
+    else:
+        quality -= 8
+
+    atr_pct = structure["atr_pct"]
+    if atr_pct >= 1.6:
+        quality -= 7
+    elif atr_pct >= 0.8:
+        quality -= 4
+    elif atr_pct < 0.35:
+        quality -= 4
+
+    if structure["regime"] in {"uptrend", "downtrend"}:
+        quality += 5
+    elif structure["regime"] == "range":
+        quality -= 2
+
+    if plan["in_mid_zone"]:
+        quality -= 4
+
+    quality = max(0, min(100, quality))
+    return quality, score_grade(quality)
+
+
+def final_action(structure, interval: str):
+    score = probability_score(structure, interval)
+    quality, grade = trade_quality(structure, interval)
+    best = best_entry_plan(structure, interval)
+
+    if score["bias"] == "NEUTRAL":
+        return "🟠 WATCH", "롱/숏 방향 차이가 작아 신규 진입보다 방향 확인 우선."
+
+    best_ev = best["ev"] if best["side"] != "NO TRADE" else -999
+    best_rr = best["rr1"] if best["side"] != "NO TRADE" else 0
+
+    if quality >= 90 and best_ev >= 2.0 and best_rr >= 2.2:
+        return "🔥 STRONG ENTRY", "방향성·손익비·기대값이 모두 강하게 우위."
+    if quality >= 80 and best_ev >= 1.0 and best_rr >= 1.6:
+        return "🟢 ENTRY OK", "진입 품질이 높지만 변동성에 맞춰 비중 조절 필요."
+    if quality >= 70 and best_ev >= 0.35:
+        if score["bias"] == "LONG BIAS":
+            return "🟡 LONG PULLBACK", "롱 우위지만 추격보다 눌림 확인 후 접근."
+        return "🟡 SHORT REBOUND", "숏 우위지만 추격보다 반등 저항 확인 후 접근."
+    if quality >= 60:
+        return "⚪ WATCH", "방향성은 있으나 품질이 애매해 확인이 더 필요."
+    return "🚫 NO TRADE", "품질·기대값·손익비 중 하나 이상이 부족해 관망 우선."
+
+
 def ai_commentary(structure, interval: str):
     score = probability_score(structure, interval)
     quality, grade = trade_quality(structure, interval)
@@ -1174,23 +1199,33 @@ def ai_commentary(structure, interval: str):
 
     comments = []
 
-    if "LONG" in action:
-        comments.append("방향성은 롱 쪽이 우세해. 다만 돌파 추격과 눌림 진입의 손익비가 다르므로, 현재가는 바로 진입보다 지지 확인이 중요해.")
-    elif "SHORT" in action:
-        comments.append("방향성은 숏 쪽이 우세해. 다만 이탈 추격과 반등 진입의 손익비가 다르므로, 현재가는 바로 진입보다 저항 확인이 중요해.")
+    if score["bias"] == "LONG BIAS":
+        comments.append("현재는 롱 방향 우위야.")
+        if "ENTRY" in action:
+            comments.append("다만 추격보다 BEST ENTRY 구간에서 분할 접근하는 편이 기대값이 높아.")
+        else:
+            comments.append("즉시 추격보다는 지지 확인 후 접근이 유리해.")
+    elif score["bias"] == "SHORT BIAS":
+        comments.append("현재는 숏 방향 우위야.")
+        if "ENTRY" in action:
+            comments.append("다만 추격보다 BEST ENTRY 반등 구간에서 분할 접근하는 편이 기대값이 높아.")
+        else:
+            comments.append("즉시 추격보다는 저항 확인 후 접근이 유리해.")
     else:
-        comments.append("현재는 방향 우위가 약해서 신규 진입보다 관망이 우선이야.")
+        comments.append("현재는 롱/숏 방향 차이가 크지 않아서 관망이 우선이야.")
 
     if best["side"] != "NO TRADE":
-        comments.append(f"{best['mode']} 기준 RR은 {best['rr1']:.2f}, EV는 {best['ev']:+.2f}R로 계산돼.")
+        comments.append(f"{best['mode']} 기준 RR1은 {best['rr1']:.2f}, EV는 {best['ev']:+.2f}R로 계산돼.")
 
-    if quality < 45:
-        comments.append("Trade Quality가 낮아 무리한 신규 진입은 피하는 편이 좋아.")
-    elif quality >= 70:
-        comments.append("Trade Quality는 양호하지만, 변동성과 손절 위치는 반드시 확인해야 해.")
+    comments.append(f"추천도는 {quality/10:.1f}/10 수준이야.")
+
+    if quality >= 80:
+        comments.append("시장 품질은 높은 편이지만, 고배율 추격 진입은 피하는 게 좋아.")
+    elif quality < 60:
+        comments.append("시장 품질이 애매해서 포지션 크기를 줄이거나 진입을 보류하는 게 좋아.")
 
     if structure["atr_pct"] >= 1.6:
-        comments.append("ATR이 매우 높아 레버리지와 진입 비중은 줄이는 게 안전해.")
+        comments.append("ATR이 매우 높아 레버리지와 진입 비중은 보수적으로 잡아야 해.")
     elif structure["atr_pct"] >= 0.8:
         comments.append("변동성이 큰 편이라 분할 간격을 넓게 잡는 게 유리해.")
 
@@ -1210,6 +1245,7 @@ def strategy_text(structure, interval: str):
     action, action_reason = final_action(structure, interval)
     best = best_entry_plan(structure, interval)
     pos = position_context(structure)
+    stars = star_rating(quality)
 
     regime_info = structure["regime_info"]
     atr_pct = structure["atr_pct"]
@@ -1234,16 +1270,17 @@ def strategy_text(structure, interval: str):
 
     lines = [
         "━━━━━━━━━━━━━━",
-        "📊 <b>실전 모드 V17</b>",
+        "📊 <b>실전 모드 V18</b>",
         "━━━━━━━━━━━━━━",
         "",
-        f"📈 <b>방향성</b>: {score['bias']}",
         f"🎯 <b>행동</b>: {action}",
+        f"{stars}",
         f"└ {action_reason}",
         "",
         f"🏆 <b>Trade Quality</b>: {quality:.0f}/100 ({grade})",
-        f"🟢 LONG BIAS: <b>{score['long_prob']}%</b> · {score['long_score']:.0f}점 ({score['long_grade']})",
-        f"🔴 SHORT BIAS: <b>{score['short_prob']}%</b> · {score['short_score']:.0f}점 ({score['short_grade']})",
+        f"📈 <b>방향성</b>: {score['bias']}",
+        f"🟢 LONG: <b>{score['long_prob']}%</b> · {score['long_score']:.0f}점 ({score['long_grade']})",
+        f"🔴 SHORT: <b>{score['short_prob']}%</b> · {score['short_score']:.0f}점 ({score['short_grade']})",
         "",
         "━━━━━━━━━━━━━━",
         "🧮 <b>점수 근거</b>",
@@ -1281,30 +1318,30 @@ def strategy_text(structure, interval: str):
             f"TP1: {format_price(best['tp1'])}",
             f"TP2: {format_price(best['tp2'])}",
             f"SL: {format_price(best['sl'])}",
-            f"눌림/반등 RR1: {best['rr1']:.2f} ({rr_grade(best['rr1'])})",
-            f"눌림/반등 RR2: {best['rr2']:.2f} ({rr_grade(best['rr2'])})",
-            f"BEST ENTRY EV: {best['ev']:+.2f}R",
+            f"BEST RR1: {best['rr1']:.2f} ({rr_grade(best['rr1'])})",
+            f"BEST RR2: {best['rr2']:.2f} ({rr_grade(best['rr2'])})",
+            f"BEST EV: {best['ev']:+.2f}R",
         ])
 
     lines.extend([
         "",
         "━━━━━━━━━━━━━━",
-        "🟢 <b>LONG PLAN</b>",
+        "🟢 <b>LONG 돌파 PLAN</b>",
         "━━━━━━━━━━━━━━",
-        f"돌파 진입 판단: <b>{score['long_decision']}</b>",
-        f"돌파 진입: {format_price(plan['long_entry'])} 돌파 후 안착",
-        f"TP1: {format_price(plan['long_tp1'])} / 돌파 R:R {plan['long_rr1']:.2f} ({rr_grade(plan['long_rr1'])})",
-        f"TP2: {format_price(plan['long_tp2'])} / 돌파 R:R {plan['long_rr2']:.2f} ({rr_grade(plan['long_rr2'])})",
+        f"판단: <b>{score['long_decision']}</b>",
+        f"진입: {format_price(plan['long_entry'])} 돌파 후 안착",
+        f"TP1: {format_price(plan['long_tp1'])} / R:R {plan['long_rr1']:.2f} ({rr_grade(plan['long_rr1'])})",
+        f"TP2: {format_price(plan['long_tp2'])} / R:R {plan['long_rr2']:.2f} ({rr_grade(plan['long_rr2'])})",
         f"SL: {format_price(plan['long_sl'])}",
         f"이유: {score['long_decision_reason']}",
         "",
         "━━━━━━━━━━━━━━",
-        "🔴 <b>SHORT PLAN</b>",
+        "🔴 <b>SHORT 이탈 PLAN</b>",
         "━━━━━━━━━━━━━━",
-        f"이탈 진입 판단: <b>{score['short_decision']}</b>",
-        f"이탈 진입: {format_price(plan['short_entry'])} 이탈 후 저항화",
-        f"TP1: {format_price(plan['short_tp1'])} / 이탈 R:R {plan['short_rr1']:.2f} ({rr_grade(plan['short_rr1'])})",
-        f"TP2: {format_price(plan['short_tp2'])} / 이탈 R:R {plan['short_rr2']:.2f} ({rr_grade(plan['short_rr2'])})",
+        f"판단: <b>{score['short_decision']}</b>",
+        f"진입: {format_price(plan['short_entry'])} 이탈 후 저항화",
+        f"TP1: {format_price(plan['short_tp1'])} / R:R {plan['short_rr1']:.2f} ({rr_grade(plan['short_rr1'])})",
+        f"TP2: {format_price(plan['short_tp2'])} / R:R {plan['short_rr2']:.2f} ({rr_grade(plan['short_rr2'])})",
         f"SL: {format_price(plan['short_sl'])}",
         f"이유: {score['short_decision_reason']}",
         "",
@@ -1328,7 +1365,7 @@ def strategy_text(structure, interval: str):
         *split["lines"][1:],
         "",
         "━━━━━━━━━━━━━━",
-        "🧠 <b>AI 코멘트</b>",
+        "🧠 <b>실전 코멘트</b>",
         "━━━━━━━━━━━━━━",
         ai_commentary(structure, interval),
         "",
@@ -1341,7 +1378,7 @@ def strategy_text(structure, interval: str):
 
 def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) -> str:
     image_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    title = f"{symbol} {display_interval(interval)} | Strategy V17"
+    title = f"{symbol} {display_interval(interval)} | Strategy V18"
 
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="inherit")
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, gridstyle="--", y_on_right=True)
@@ -1395,7 +1432,7 @@ def create_chart_image(symbol: str, interval: str, df: pd.DataFrame, structure) 
 
     atr_pct = structure["atr_pct"]
     risk = "HIGH VOLATILITY" if atr_pct >= 1.6 else ("VOLATILITY CAUTION" if atr_pct >= 0.8 else "NORMAL VOL")
-    ax.text(0.015, 0.97, f"{probability_score(structure, interval)['bias']}\n{final_action(structure, interval)[0]}\nQ {trade_quality(structure, interval)[0]:.0f}/100\nL {score['long_prob']}% / S {score['short_prob']}%\n{risk}", transform=ax.transAxes, fontsize=9, ha="left", va="top", color="white", bbox=dict(boxstyle="round,pad=0.35", fc="#111111", ec="#888888", alpha=0.72), zorder=12)
+    ax.text(0.015, 0.97, f"{probability_score(structure, interval)['bias']}\n{final_action(structure, interval)[0]}\n{star_rating(trade_quality(structure, interval)[0])}\nQ {trade_quality(structure, interval)[0]:.0f}/100\nL {score['long_prob']}% / S {score['short_prob']}%\n{risk}", transform=ax.transAxes, fontsize=9, ha="left", va="top", color="white", bbox=dict(boxstyle="round,pad=0.35", fc="#111111", ec="#888888", alpha=0.72), zorder=12)
 
     fig.savefig(image_path, dpi=145, bbox_inches="tight")
     return image_path
@@ -1447,7 +1484,7 @@ async def telegram_webhook(secret: str, request: Request):
         )
 
         send_photo(chat_id, image_path, caption)
-        send_message(chat_id, strategy_text(structure, interval) + "\n\n※ 자동 분석이며 확정 신호가 아니라 리스크 관리용 시나리오야.")
+        send_message(chat_id, strategy_text(structure, interval))
 
         try:
             Path(image_path).unlink(missing_ok=True)
